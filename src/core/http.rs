@@ -1,0 +1,405 @@
+use std::{
+    fs,
+    io::{
+        ErrorKind,
+        Read,
+        Write,
+        Seek,
+        SeekFrom
+    },
+    path::Path,
+    sync::{
+        atomic::{self, AtomicBool},
+        Arc,
+        Mutex
+    },
+    time::Duration
+};
+use std::thread;
+use thread_priority::{ThreadBuilderExt, ThreadPriority};
+
+use arc_swap::ArcSwap;
+use serde::de::DeserializeOwned;
+
+use super::{Error, Hachimi};
+
+const TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_MAX_RETRIES: usize = 3;
+const DOWNLOAD_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+pub struct AsyncRequest<T: Send + Sync> {
+    request: Mutex<Option<http::Request<ureq::Body>>>,
+    map_fn: fn(http::Response<ureq::Body>) -> Result<T, Error>,
+    running: AtomicBool,
+    pub result: ArcSwap<Option<Result<T, Error>>>
+}
+
+pub fn ureq_config() -> ureq::config::Config {
+    ureq_config_with_timeout(Some(TIMEOUT))
+}
+
+pub fn ureq_config_with_timeout(timeout: Option<Duration>) -> ureq::config::Config {
+    use ureq::config::IpFamily::*;
+
+    ureq::config::Config::builder()
+        .ip_family(if Hachimi::instance().config.load().ipv4_only { Ipv4Only } else { Any })
+        .timeout_connect(timeout)
+        .build()
+}
+
+fn is_retryable_download_error(e: &Error) -> bool {
+    fn transient_io(e: &std::io::Error) -> bool {
+        matches!(
+            e.kind(),
+            ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::Interrupted
+        )
+    }
+    match e {
+        Error::HttpError(ureq::Error::Timeout(_)) => true,
+        Error::HttpError(ureq::Error::Io(e)) | Error::IoError(e) => transient_io(e),
+        Error::RuntimeError(msg) => msg.starts_with("Parallel chunk truncated"),
+        _ => false,
+    }
+}
+
+impl<T: Send + Sync + 'static> AsyncRequest<T> {
+    pub fn new(request: http::Request<ureq::Body>, map_fn: fn(http::Response<ureq::Body>) -> Result<T, Error>) -> Self {
+        AsyncRequest {
+            request: Mutex::new(Some(request)),
+            map_fn,
+            running: AtomicBool::new(false),
+            result: ArcSwap::default()
+        }
+    }
+
+    pub fn call(self: Arc<Self>) {
+        self.result.store(Arc::new(None));
+        self.running.store(true, atomic::Ordering::Release);
+        let req = self.request.lock().unwrap().take().expect("Request run twice");
+        std::thread::spawn(move || {
+            let agent = ureq::Agent::new_with_config(ureq_config());
+
+            let res = match agent.run(req) {
+                Ok(v) => (self.map_fn)(v),
+                Err(e) => Err(Error::from(e))
+            };
+            self.result.store(Arc::new(Some(res)));
+            self.running.store(false, atomic::Ordering::Release);
+        });
+    }
+
+    pub fn running(&self) -> bool {
+        self.running.load(atomic::Ordering::Acquire)
+    }
+}
+
+impl<T: Send + Sync + 'static + DeserializeOwned> AsyncRequest<T> {
+    pub fn with_json_response(request: http::Request<ureq::Body>) -> AsyncRequest<T> {
+        AsyncRequest::new(request, |res|
+            Ok(serde_json::from_str(&res.into_body().read_to_string()?)?)
+        )
+    }
+}
+
+pub fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, Error> {
+    let agent: ureq::Agent = ureq::Agent::new_with_config(ureq_config());
+    let res = agent.get(url).call()?;
+    Ok(serde_json::from_str(&res.into_body().read_to_string()?)?)
+}
+
+pub fn get_json_with_timeout<T: DeserializeOwned>(url: &str, timeout: Duration) -> Result<T, Error> {
+    let agent: ureq::Agent = ureq::Agent::new_with_config(ureq_config_with_timeout(Some(timeout)));
+    let res = agent.get(url).call()?;
+    Ok(serde_json::from_str(&res.into_body().read_to_string()?)?)
+}
+
+pub fn get_github_json<T: DeserializeOwned>(url: &str) -> Result<T, Error> {
+    let res = ureq::get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .call()?;
+    Ok(serde_json::from_str(&res.into_body().read_to_string()?)?)
+}
+
+pub fn download_file_parallel(url: &str, file_path: &Path, num_threads: usize,
+    min_chunk_size: u64, chunk_size: usize, progress_callback: Arc<dyn Fn(usize) + Send + Sync>
+) -> Result<(), Error> {
+    let agent: ureq::Agent = ureq::Agent::new_with_config(ureq_config());
+    let mut head_res = None;
+    for attempt in 0..=DOWNLOAD_MAX_RETRIES {
+        if attempt > 0 {
+            thread::sleep(DOWNLOAD_RETRY_BACKOFF * (1u32 << attempt.min(16)));
+        }
+        match agent.head(url).call() {
+            Ok(r) => {
+                head_res = Some(r);
+                break;
+            }
+            Err(e) => {
+                let err = Error::from(e);
+                if attempt == DOWNLOAD_MAX_RETRIES || !is_retryable_download_error(&err) {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    let res = head_res.unwrap();
+
+    let content_length = res.headers()
+        .get("Content-Length")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let accepts_ranges = res.headers().get("Accept-Ranges").map_or(false, |v| v == "bytes");
+
+    let mut actual_length = 0u64;
+    let mut use_parallel = false;
+
+    if let Some(length) = content_length {
+        actual_length = length;
+        if accepts_ranges && length > min_chunk_size {
+            if let Ok(test_res) = agent.get(url).header("Range", "bytes=0-0").call() {
+                if test_res.status() == 206 {
+                    use_parallel = true;
+                }
+            }
+        }
+    }
+
+    if use_parallel {
+        let downloaded_file = fs::File::create(file_path)?;
+        downloaded_file.set_len(actual_length)?;
+        drop(downloaded_file);
+
+        let chunk_size_per_thread = (actual_length / num_threads as u64).max(min_chunk_size);
+        let num_chunks = (actual_length + chunk_size_per_thread - 1) / chunk_size_per_thread;
+
+        let fatal_error = Arc::new(Mutex::new(None::<Error>));
+        let needs_fallback = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = crossbeam_channel::unbounded::<(u64, u64)>();
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for _ in 0..num_threads {
+            let agent_clone = agent.clone();
+            let url_clone = url.to_string();
+            let path_clone = file_path.to_path_buf();
+            let receiver_clone = receiver.clone();
+            let progress_callback_clone = Arc::clone(&progress_callback);
+            let fatal_error_clone = Arc::clone(&fatal_error);
+            let stop_signal_clone = Arc::clone(&stop_signal);
+            let needs_fallback_clone = Arc::clone(&needs_fallback);
+
+            let handle = thread::Builder::new()
+                .name("downloader_chunk".into())
+                .spawn_with_priority(ThreadPriority::Min, move |result| {
+                    if result.is_err() { warn!("Failed to set downloader thread priority."); }
+                    let mut file = match fs::File::options().write(true).open(&path_clone) {
+                        Ok(f) => f,
+                        Err(e) => { *fatal_error_clone.lock().unwrap() = Some(e.into()); return; }
+                    };
+                    let mut buffer = vec![0u8; chunk_size];
+                    while let Ok((start, end)) = receiver_clone.recv() {
+                        if stop_signal_clone.load(atomic::Ordering::Relaxed) { break; }
+
+                        let expected_bytes = end - start + 1;
+                        let mut written: u64 = 0;
+                        let mut attempt = 0;
+                        loop {
+                            if attempt > 0 {
+                                thread::sleep(DOWNLOAD_RETRY_BACKOFF * (1u32 << attempt.min(16)));
+                            }
+                            let range_header = format!("bytes={}-{}", start + written, end);
+                            let result = (|| -> Result<(), Error> {
+                                let res = agent_clone.get(&url_clone).header("Range", &range_header).call()?;
+
+                                if res.status() == 200 {
+                                    needs_fallback_clone.store(true, atomic::Ordering::Relaxed);
+                                    stop_signal_clone.store(true, atomic::Ordering::Relaxed);
+                                    return Ok(());
+                                }
+
+                                if res.status() != 206 {
+                                    return Err(Error::RuntimeError(format!(
+                                        "Parallel chunk failed: Expected 206 Partial Content, got {}", res.status()
+                                    )));
+                                }
+
+                                let mut binding = res.into_body();
+                                let mut reader = binding.as_reader();
+                                file.seek(SeekFrom::Start(start + written))?;
+
+                                let mut remaining = expected_bytes - written;
+
+                                loop {
+                                    let to_read = (buffer.len() as u64).min(remaining) as usize;
+                                    let bytes_read = reader.read(&mut buffer[..to_read])?;
+                                    if bytes_read == 0 { break; }
+                                    file.write_all(&buffer[..bytes_read])?;
+                                    progress_callback_clone(bytes_read);
+
+                                    written += bytes_read as u64;
+                                    remaining -= bytes_read as u64;
+                                    if remaining == 0 { break; }
+                                }
+
+                                if remaining > 0 {
+                                    return Err(Error::RuntimeError(format!("Parallel chunk truncated. Missing {} bytes", remaining)));
+                                }
+                                Ok(())
+                            })();
+                            match result {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    if attempt >= DOWNLOAD_MAX_RETRIES || !is_retryable_download_error(&e) {
+                                        *fatal_error_clone.lock().unwrap() = Some(e);
+                                        stop_signal_clone.store(true, atomic::Ordering::Relaxed);
+                                        break;
+                                    }
+                                    attempt += 1;
+                                }
+                            }
+                        }
+                    }
+                }).unwrap();
+            handles.push(handle);
+        }
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size_per_thread;
+            let end = (start + chunk_size_per_thread - 1).min(actual_length - 1);
+            if sender.send((start, end)).is_err() { break; }
+        }
+        drop(sender);
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        if needs_fallback.load(atomic::Ordering::Relaxed) {
+            debug!("Server returned 200 instead of 206, falling back to single-threaded download for: {}", url);
+            let _ = fs::remove_file(file_path);
+        } else if let Some(e) = fatal_error.lock().unwrap().take() {
+            return Err(e);
+        } else {
+            let downloaded_file = fs::File::options().write(true).open(file_path)?;
+            downloaded_file.sync_data()?;
+            return Ok(());
+        }
+    }
+
+    debug!("Using single-threaded download for: {}", url);
+
+    let mut file = fs::File::create(file_path)?;
+    let mut buffer = vec![0u8; chunk_size];
+    let mut downloaded: u64 = 0;
+    let mut attempt = 0;
+    loop {
+        if attempt > 0 {
+            thread::sleep(DOWNLOAD_RETRY_BACKOFF * (1u32 << attempt.min(16)));
+        }
+        let mut request = agent.get(url);
+        if downloaded > 0 {
+            request = request.header("Range", &format!("bytes={}-", downloaded));
+        }
+        let res = match request.call() {
+            Ok(r) => r,
+            Err(e) => {
+                let err = Error::from(e);
+                if attempt >= DOWNLOAD_MAX_RETRIES || !is_retryable_download_error(&err) {
+                    return Err(err);
+                }
+                attempt += 1;
+                continue;
+            }
+        };
+        let status = res.status();
+        if status == 206 {
+            if downloaded > 0 {
+                file.seek(SeekFrom::Start(downloaded))?;
+            }
+        } else if downloaded > 0 {
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            downloaded = 0;
+        }
+        let expected_length = res.headers()
+            .get("Content-Length")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|len| if status == 206 { downloaded + len } else { len });
+        match download_file_buffered(res, &mut file, &mut buffer, |bytes_slice| {
+            progress_callback(bytes_slice.len());
+        }) {
+            Ok(()) => {
+                downloaded = file.stream_position()?;
+                let complete = expected_length.map_or(true, |expected| downloaded == expected);
+                if complete {
+                    file.sync_data()?;
+                    return Ok(());
+                }
+                if attempt >= DOWNLOAD_MAX_RETRIES {
+                    return Err(Error::RuntimeError(format!(
+                        "Download incomplete: expected {} bytes, got {} bytes",
+                        expected_length.unwrap_or(0), downloaded
+                    )));
+                }
+                attempt += 1;
+            }
+            Err(e) => {
+                downloaded = file.stream_position()?;
+                if let Some(expected) = expected_length {
+                    if downloaded >= expected {
+                        file.sync_data()?;
+                        return Ok(());
+                    }
+                }
+                if attempt >= DOWNLOAD_MAX_RETRIES || !is_retryable_download_error(&e) {
+                    return Err(e);
+                }
+                attempt += 1;
+            }
+        }
+    }
+}
+
+pub fn download_file_buffered(res: http::Response<ureq::Body>, file: &mut std::fs::File, buffer: &mut [u8], mut add_bytes: impl FnMut(&[u8])) -> Result<(), Error> {
+    let mut body = res.into_body();
+    let mut reader = body.as_reader();
+    let mut buffer_pos = 0usize;
+    loop {
+        let read_bytes = reader.read(&mut buffer[buffer_pos..])?;
+
+        let prev_buffer_pos = buffer_pos;
+        buffer_pos += read_bytes;
+        add_bytes(&buffer[prev_buffer_pos..buffer_pos]);
+
+        if buffer_pos == buffer.len() {
+            let written = file.write(&buffer)?;
+            if written != buffer.len() {
+                return Err(Error::OutOfDiskSpace);
+            }
+            buffer_pos = 0;
+        }
+
+        if read_bytes == 0 {
+            break;
+        }
+    }
+
+    // Download finished, flush the buffer
+    if buffer_pos != 0 {
+        let written = file.write(&buffer[..buffer_pos])?;
+        if written != buffer_pos {
+            return Err(Error::OutOfDiskSpace);
+        }
+    }
+
+    Ok(())
+}

@@ -1,0 +1,62 @@
+use std::{fmt::Display, path::PathBuf};
+use serde::{Deserialize};
+
+use crate::game_impl;
+
+pub struct Game {
+    pub package_name: String,
+    pub region: Region,
+    pub data_dir: PathBuf,
+
+    #[cfg(target_os = "windows")]
+    pub is_steam_release: bool
+}
+
+#[derive(PartialEq, Eq, Deserialize)]
+pub enum Region {
+    Unknown,
+    Japan,
+    Taiwan,
+    Korea,
+    China,
+    Global
+}
+
+impl Region {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Region::Unknown => "Unknown",
+            Region::Japan => "Japan",
+            Region::Taiwan => "Taiwan",
+            Region::Korea => "Korea",
+            Region::China => "China",
+            Region::Global => "Global"
+        }
+    }
+}
+
+impl Display for Region {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Game {
+    pub fn init() -> Game {
+        let package_name = game_impl::get_package_name();
+        let region = game_impl::get_region(&package_name);
+        let data_dir = game_impl::get_data_dir(&package_name);
+
+        #[cfg(target_os = "windows")]
+        let is_steam_release = game_impl::is_steam_release(&package_name);
+
+        Game {
+            package_name,
+            region,
+            data_dir,
+
+            #[cfg(target_os = "windows")]
+            is_steam_release
+        }
+    }
+}

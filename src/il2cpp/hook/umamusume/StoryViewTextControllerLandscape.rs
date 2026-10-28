@@ -1,0 +1,64 @@
+use crate::{
+    core::{Hachimi, game::Region},
+    il2cpp::{
+        hook::UnityEngine_UI::Text,
+        symbols::{get_field_from_name, get_field_object_value, get_method_addr},
+        types::*
+    }
+};
+
+use super::TextFrame;
+
+static mut _TEXTFRAME_FIELD: *mut FieldInfo = 0 as _;
+pub fn get__textFrame(this: *mut Il2CppObject) -> *mut Il2CppObject {
+    get_field_object_value(this, unsafe { _TEXTFRAME_FIELD })
+}
+
+type SetFontSizeFn = extern "C" fn(this: *mut Il2CppObject, font_size: i32);
+extern "C" fn SetFontSize(this: *mut Il2CppObject, font_size: i32) {
+    get_orig_fn!(SetFontSize, SetFontSizeFn)(this, font_size);
+
+    let text_frame = get__textFrame(this);
+    let text_label = TextFrame::get_TextLabel(text_frame);
+    let localized_data = Hachimi::instance().localized_data.load();
+
+    if let Some(mult) = localized_data.config.text_frame_font_size_multiplier {
+        let font_size = Text::get_fontSize(text_label);
+        Text::set_fontSize(text_label, (font_size as f32 * mult).round() as i32);
+    }
+    
+    if Hachimi::instance().game.region == Region::Global || Hachimi::instance().game.region == Region::Taiwan { 
+        if let Some(mult) = localized_data.config.text_frame_line_spacing_multiplier {
+            let line_spacing = Text::get_lineSpacing(text_label);
+            Text::set_lineSpacing(text_label, line_spacing * mult);
+        }
+    }
+}
+
+type SetLineSpacingFn = extern "C" fn(this: *mut Il2CppObject, fontSize: i32);
+extern "C" fn SetLineSpacing(this: *mut Il2CppObject, fontSize: i32) {
+    get_orig_fn!(SetLineSpacing, SetLineSpacingFn)(this, fontSize);
+
+    if let Some(mult) = Hachimi::instance().localized_data.load().config.text_frame_line_spacing_multiplier {
+        let text_frame = get__textFrame(this);
+        let text_label = TextFrame::get_TextLabel(text_frame);
+        let line_spacing = Text::get_lineSpacing(text_label);
+        Text::set_lineSpacing(text_label, line_spacing * mult);
+    }
+}
+
+pub fn init(umamusume: *const Il2CppImage) {
+    get_class_or_return!(umamusume, Gallop, StoryViewTextControllerLandscape);
+
+    let SetFontSize_addr = get_method_addr(StoryViewTextControllerLandscape, c"SetFontSize", 1);
+    new_hook!(SetFontSize_addr, SetFontSize);
+
+    if Hachimi::instance().game.region == Region::Japan {
+        let SetLineSpacing_addr = get_method_addr(StoryViewTextControllerLandscape, c"SetLineSpacing", 1);
+        new_hook!(SetLineSpacing_addr, SetLineSpacing);
+    }
+
+    unsafe {
+        _TEXTFRAME_FIELD = get_field_from_name(StoryViewTextControllerLandscape, c"_textFrame");
+    }
+}

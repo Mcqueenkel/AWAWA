@@ -1,0 +1,266 @@
+use std::{sync::{Arc, Mutex}, time::Duration};
+
+use rust_i18n::t;
+use serde::Deserialize;
+
+use crate::core::{gui::{HachimiUpdateWindow, NotificationGuard}, hachimi::{REPO_PATH, CODEBERG_API, GITHUB_API}, http, Error, Gui, Hachimi};
+
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ponytail: AWAWA has no release channel yet; never offer upstream's installer over this DLL.
+// Return true once releases (installer + blake3 assets) are published on REPO_PATH; also hides the "Check for updates" buttons.
+pub fn self_update_enabled() -> bool {
+    false
+}
+
+#[derive(Default)]
+pub struct Updater {
+    update_check_mutex: Mutex<()>,
+    #[cfg(target_os = "windows")]
+    new_update: arc_swap::ArcSwap<Option<ReleaseAsset>>
+}
+
+impl Updater {
+    pub fn check_for_updates(self: Arc<Self>, callback: fn(bool)) {
+        std::thread::spawn(move || {
+            match self.check_for_updates_internal() {
+                Ok(v) => callback(v),
+                Err(e) => error!("{}", e)
+            }
+        });
+    }
+
+    fn check_for_updates_internal(&self) -> Result<bool, Error> {
+        if !self_update_enabled() { warn!("self-update disabled in fork build"); return Ok(false); }
+
+        // Prevent multiple update checks running at the same time
+        let Ok(_guard) = self.update_check_mutex.try_lock() else {
+            return Ok(false);
+        };
+
+        let checking_notif_id = if let Some(mutex) = Gui::instance() {
+            Some(mutex.lock().unwrap().show_persistent_notification(&t!("notification.checking_for_updates")))
+        } else {
+            None
+        };
+        let _guard = checking_notif_id.map(NotificationGuard);
+
+        let latest = match http::get_json_with_timeout::<Release>(
+            &format!("{}/{}/releases/latest", GITHUB_API, REPO_PATH), UPDATE_CHECK_TIMEOUT
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("GitHub update check failed, trying Codeberg: {}", e);
+                if let Some(mutex) = Gui::instance() {
+                    mutex.lock().unwrap().show_notification(&t!("notification.github_update_unreachable"));
+                }
+                http::get_json_with_timeout::<Release>(
+                    &format!("{}/{}/releases/latest", CODEBERG_API, REPO_PATH), UPDATE_CHECK_TIMEOUT
+                )?
+            }
+        };
+
+        if latest.is_newer_version() {
+            #[cfg(target_os = "windows")]
+            {
+                let installer_asset = latest.assets.iter().find(|asset| asset.name == "hachimi_installer.exe");
+                let hash_asset = latest.assets.iter().find(|asset| asset.name == "blake3.json");
+    
+                if let (Some(installer), Some(h_json)) = (installer_asset, hash_asset) {
+                    let hash_data = http::get_json::<Blake3Hashes>(&h_json.browser_download_url)?;
+                    let mut asset = installer.clone();
+                    asset.expected_hash = Some(hash_data.installer_exe);
+                    self.new_update.store(Arc::new(Some(asset)));
+    
+                    if let Some(mutex) = Gui::instance() {
+                        mutex.lock().unwrap().show_window(Box::new(HachimiUpdateWindow::new(
+                            &t!("update_prompt_dialog.title"),
+                            &t!("update_prompt_dialog.content", version = latest.tag_name),
+                            |ok| {
+                                if !ok { return; }
+                                Hachimi::instance().updater.clone().run();
+                            }
+                        )));
+                    }
+                    return Ok(true);
+                }
+            }
+            #[cfg(target_os = "android")]
+            {
+                if let Some(mutex) = Gui::instance() {
+                    mutex.lock().unwrap().show_window(Box::new(HachimiUpdateWindow::new(
+                        &t!("update_prompt_dialog.title"),
+                        &t!("update_prompt_dialog.android_content", version = latest.tag_name),
+                        |ok| {
+                            if !ok { return; }
+                            Hachimi::instance().updater.clone().run();
+                        }
+                    )));
+                }
+            }
+        } else if let Some(mutex) = Gui::instance() {
+            mutex.lock().unwrap().show_notification(&t!("notification.no_updates"));
+        }
+
+        Ok(false)
+    }
+
+    pub fn run(self: Arc<Self>) {
+        #[cfg(target_os = "windows")]
+        {
+            std::thread::spawn(move || {
+                let dialog_show = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                if let Some(mutex) = Gui::instance() {
+                    mutex.lock().unwrap().show_window(Box::new(crate::core::gui::PersistentMessageWindow::new(
+                        &t!("updating_dialog.title"),
+                        &t!("updating_dialog.content"),
+                        dialog_show.clone()
+                    )));
+                }
+    
+                if let Err(e) = self.clone().run_internal() {
+                    error!("{}", e);
+                    if let Some(mutex) = Gui::instance() {
+                        mutex.lock().unwrap().show_notification(&t!("notification.update_failed", reason = e.to_string()));
+                    }
+                }
+    
+                dialog_show.store(false, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
+        #[cfg(target_os = "android")]
+        {
+            use crate::{
+                core::hachimi::UMAPATCHER_UPDATER_DEEPLINK,
+                il2cpp::{ext::StringExt, hook::UnityEngine_CoreModule::Application}
+            };
+            Application::OpenURL(UMAPATCHER_UPDATER_DEEPLINK.to_il2cpp_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn run_internal(self: Arc<Self>) -> Result<(), Error> {
+        let Some(ref asset) = **self.new_update.load() else {
+            return Ok(());
+        };
+        self.new_update.store(Arc::new(None));
+
+        use crate::windows::{main::DLL_HMODULE, utils::{self, get_module_file_name}};
+        use windows::{
+            core::{HSTRING, PCWSTR},
+            Win32::{
+                Foundation::{WPARAM, LPARAM},
+                UI::{Shell::ShellExecuteW, WindowsAndMessaging::{PostMessageW, SW_NORMAL, WM_CLOSE}}
+            }
+        };
+        use std::{fs::File, io::Read};
+
+        // Download the installer
+        let installer_path = utils::get_tmp_installer_path();
+
+        let res = ureq::get(&asset.browser_download_url).call()?;
+        let mut reader = res.into_body().into_reader();
+        std::io::copy(&mut reader, &mut File::create(&installer_path)?)?;
+
+        // Verify the installer
+        if let Some(expected_hash) = &asset.expected_hash {
+            let mut file = File::open(&installer_path)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = [0u8; 8192];
+
+            while let Ok(n) = file.read(&mut buffer) {
+                if n == 0 { break; }
+                hasher.update(&buffer[..n]);
+            }
+
+            if hasher.finalize().to_hex().as_str() != expected_hash {
+                let _ = std::fs::remove_file(&installer_path);
+                return Err(Error::FileHashMismatch(installer_path.to_string_lossy().into()));
+            }
+        }
+
+        // Launch the installer
+        let hachimi_path_str = unsafe { get_module_file_name(DLL_HMODULE) };
+        let game_dir = utils::get_game_dir();
+        unsafe {
+            ShellExecuteW(
+                None,
+                None,
+                &HSTRING::from(installer_path.into_os_string()),
+                &HSTRING::from(format!(
+                    "install --install-dir \"{}\" --target \"{}\" --sleep 1000 --prompt-for-game-exit --launch-game -- {}",
+                    game_dir.display(), hachimi_path_str, std::env::args().skip(1).collect::<Vec<String>>().join(" ")
+                )),
+                PCWSTR::from_raw(hachimi_path_str.as_ptr()),
+                SW_NORMAL
+            );
+
+            // Close the game
+            _ = PostMessageW(None, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+
+        Ok(())
+    }
+}
+
+struct Version(u32, u32, u32);
+
+impl Version {
+    pub fn try_parse(version: &str) -> Option<Version> {
+        let slice = version.strip_prefix('v').unwrap_or(version);
+
+        let mut parts = slice.split('.');
+        let major = parts.next()?.parse::<u32>().ok()?;
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        let patch = parts.next()?.parse::<u32>().ok()?;
+
+        if parts.next().is_none() {
+            Some(Version(major, minor, patch))
+        } else {
+            None
+        }
+    }
+
+    pub fn to_int(&self) -> u32 {
+        (self.0 << 16) | (self.1 << 8) | self.2
+    }
+}
+
+#[derive(Deserialize)]
+pub struct Release {
+    // STUB
+    pub tag_name: String,
+    #[cfg(target_os = "windows")]
+    assets: Vec<ReleaseAsset>
+}
+
+impl Release {
+    pub fn is_newer_version(&self) -> bool {
+        let local = Version::try_parse(env!("CARGO_PKG_VERSION"));
+        let remote = Version::try_parse(&self.tag_name);
+
+        // fall back to naive checking if one of them can't be parsed
+        if local.is_none() || remote.is_none() {
+            self.tag_name != format!("v{}", env!("CARGO_PKG_VERSION"))
+        } else {
+            remote.unwrap().to_int() > local.unwrap().to_int()
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Deserialize, Clone)]
+pub struct ReleaseAsset {
+    // STUB
+    name: String,
+    browser_download_url: String,
+    #[serde(skip)]
+    pub expected_hash: Option<String>
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Deserialize)]
+struct Blake3Hashes {
+    #[serde(rename = "hachimi_installer.exe")]
+    installer_exe: String
+}

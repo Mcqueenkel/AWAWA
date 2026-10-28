@@ -1,0 +1,6 @@
+/build
+/target
+/.vscode
+/plugins
+dump.cs
+.envrc

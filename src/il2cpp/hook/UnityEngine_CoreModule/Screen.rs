@@ -1,0 +1,116 @@
+use crate::{
+    il2cpp::{api::il2cpp_resolve_icall, symbols::get_method_addr, types::*},
+};
+
+#[cfg(target_os = "windows")]
+use crate::{core::{utils::scale_to_aspect_ratio, Hachimi}, windows::hachimi_impl::FullScreenMode};
+
+static mut GET_CURRENTRESOLUTION_ADDR: usize = 0;
+impl_addr_wrapper_fn!(get_currentResolution, GET_CURRENTRESOLUTION_ADDR, Resolution,);
+
+static mut GET_WIDTH_ADDR: usize = 0;
+impl_addr_wrapper_fn!(get_width, GET_WIDTH_ADDR, i32,);
+
+static mut GET_HEIGHT_ADDR: usize = 0;
+impl_addr_wrapper_fn!(get_height, GET_HEIGHT_ADDR, i32,);
+
+static mut GET_FULLSCREEN_ADDR: usize = 0;
+impl_addr_wrapper_fn!(get_fullScreen, GET_FULLSCREEN_ADDR, bool,);
+
+#[cfg(target_os = "windows")]
+pub fn apply_auto_full_screen(mut width: i32, mut height: i32) -> bool {
+    let windows_config = &Hachimi::instance().config.load().windows;
+    // ponytail: forced windowed never goes full screen; this also covers the startup call in hachimi_impl
+    if windows_config.full_screen_mode == FullScreenMode::Windowed {
+        return false;
+    }
+    let preferred_res = &windows_config.full_screen_res;
+    let (preferred_width, preferred_height) = if preferred_res.width > 0 && preferred_res.height > 0 {
+        (preferred_res.width, preferred_res.height)
+    }
+    else {
+        let res = get_currentResolution();
+        (res.width, res.height)
+    };
+
+    if width > 0 && height > 0 && (width > height) == (preferred_width > preferred_height) {
+        let aspect_ratio = width as f32 / height as f32;
+        (width, height) = scale_to_aspect_ratio((preferred_width, preferred_height), aspect_ratio, false)
+    }
+    else {
+        return false;
+    }
+
+    let full_screen_mode = windows_config.full_screen_mode as i32;
+    let preferred_refresh_rate = RefreshRate {
+        numerator: preferred_res.refresh_rate as u32,
+        denominator: 1
+    };
+    get_orig_fn!(SetResolution_Injected, SetResolutionInjectedFn)(width, height, full_screen_mode, &preferred_refresh_rate);
+
+    true
+}
+
+#[cfg(target_os = "windows")]
+type SetResolutionInjectedFn = extern "C" fn(width: i32, height: i32, fullscreen_mode: i32, preferred_refresh_rate: *const RefreshRate);
+#[cfg(target_os = "windows")]
+pub fn set_resolution_direct(width: i32, height: i32, fullscreen_mode: i32, preferred_refresh_rate: *const RefreshRate) {
+    get_orig_fn!(SetResolution_Injected, SetResolutionInjectedFn)(width, height, fullscreen_mode, preferred_refresh_rate);
+}
+
+#[cfg(target_os = "windows")]
+extern "C" fn SetResolution_Injected(width: i32, height: i32, full_screen_mode: i32, preferred_refresh_rate: *const RefreshRate) {
+    let windows_config = &Hachimi::instance().config.load().windows;
+    if windows_config.freeform_window {
+        crate::il2cpp::hook::umamusume::StandaloneWindowResize::set_is_prevent_reshape(true);
+        return;
+    }
+
+    if windows_config.auto_full_screen {
+        if apply_auto_full_screen(width, height) {
+            return;
+        }
+    }
+
+    // ponytail: forced windowed keeps the size the game asked for and only replaces the mode; Unity's native Alt+Enter is not blocked
+    let full_screen_mode = if windows_config.full_screen_mode == FullScreenMode::Windowed {
+        super::FullScreenMode_Windowed
+    } else {
+        full_screen_mode
+    };
+    get_orig_fn!(SetResolution_Injected, SetResolutionInjectedFn)(width, height, full_screen_mode, preferred_refresh_rate);
+}
+
+#[cfg(target_os = "windows")]
+type RequestOrientationFn = extern "C" fn(orientation: ScreenOrientation);
+#[cfg(target_os = "windows")]
+extern "C" fn RequestOrientation(orientation: ScreenOrientation) {
+    if Hachimi::instance().config.load().windows.freeform_window {
+        return;
+    }
+
+    get_orig_fn!(RequestOrientation, RequestOrientationFn)(orientation);
+}
+
+pub fn init(UnityEngine_CoreModule: *const Il2CppImage) {
+    get_class_or_return!(UnityEngine_CoreModule, UnityEngine, Screen);
+
+    #[cfg(target_os = "windows")]
+    {
+        let SetResolution_Injected_addr = il2cpp_resolve_icall(
+            c"UnityEngine.Screen::SetResolution_Injected(System.Int32,System.Int32,\
+            UnityEngine.FullScreenMode,UnityEngine.RefreshRate)".as_ptr()
+        );
+        new_hook!(SetResolution_Injected_addr, SetResolution_Injected);
+
+        let RequestOrientation_addr = il2cpp_resolve_icall(c"UnityEngine.Screen::RequestOrientation()".as_ptr());
+        new_hook!(RequestOrientation_addr, RequestOrientation);
+    }
+
+    unsafe {
+        GET_CURRENTRESOLUTION_ADDR = get_method_addr(Screen, c"get_currentResolution", 0);
+        GET_WIDTH_ADDR = il2cpp_resolve_icall(c"UnityEngine.Screen::get_width()".as_ptr());
+        GET_HEIGHT_ADDR = il2cpp_resolve_icall(c"UnityEngine.Screen::get_height()".as_ptr());
+        GET_FULLSCREEN_ADDR = il2cpp_resolve_icall(c"UnityEngine.Screen::get_fullScreen()".as_ptr());
+    }
+}
