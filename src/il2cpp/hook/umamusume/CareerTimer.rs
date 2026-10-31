@@ -25,6 +25,7 @@ struct State {
     loaded: bool,         // the file was read this session
     resume_pending: bool, // count this session once the first turn is read
     finished: bool,    // result screen seen; wait until the career scene is left
+    drop_since: Option<Instant>, // the turn has read lower than the saved one since then
     last_real_scene: i32,
     last_tick: Option<Instant>,
     next_poll: Instant,
@@ -36,6 +37,7 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 const POLL: Duration = Duration::from_secs(1);
 const SAVE_EVERY: Duration = Duration::from_secs(30);
 const MAX_FRAME: Duration = Duration::from_secs(5); // a longer gap (hang, debugger) is not counted
+const DROP_HOLD: Duration = Duration::from_secs(10);
 
 fn dir() -> PathBuf {
     Hachimi::instance().game.data_dir.clone()
@@ -64,6 +66,17 @@ fn now_text() -> String {
 fn fmt_secs(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     if s >= 3600 { format!("{}h {:02}m {:02}s", s / 3600, s / 60 % 60, s % 60) } else { format!("{}m {:02}s", s / 60, s % 60) }
+}
+
+// Whether to track this turn. A turn lower than the saved one counts only once it has held for
+// DROP_HOLD: right after the game reloads into a career it can read turn 1 for a moment.
+fn turn_ok(saved_last: Option<i32>, turn: i32, drop_since: &mut Option<Instant>, now: Instant) -> bool {
+    if saved_last.is_some_and(|last| turn < last) {
+        now.duration_since(*drop_since.get_or_insert(now)) >= DROP_HOLD
+    } else {
+        *drop_since = None;
+        true
+    }
 }
 
 // A turn lower than the saved one means a new career; otherwise the saved one continues.
@@ -116,7 +129,7 @@ pub fn tick() {
     let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     let st = guard.get_or_insert_with(|| State {
-        saved: None, loaded: false, resume_pending: false, finished: false, last_real_scene: 0, last_tick: None, next_poll: now, next_save: now + SAVE_EVERY
+        saved: None, loaded: false, resume_pending: false, finished: false, drop_since: None, last_real_scene: 0, last_tick: None, next_poll: now, next_save: now + SAVE_EVERY
     });
 
     let scene = SceneManager::current_scene_id() as i32;
@@ -163,6 +176,9 @@ pub fn tick() {
     }
 
     let Some(turn) = current_turn() else { return };
+    if !turn_ok(st.saved.as_ref().map(|s| s.last_turn), turn, &mut st.drop_since, now) {
+        return;
+    }
     st.saved = Some(track(st.saved.take(), turn, std::mem::take(&mut st.resume_pending)));
 
     if now >= st.next_save {
@@ -185,6 +201,16 @@ mod tests {
         assert_eq!(resumed.sessions, 2, "same turn after a restart continues");
         let fresh = track(Some(mid), 1, true);
         assert_eq!((fresh.first_turn, fresh.secs, fresh.sessions), (1, 0.0, 1), "lower turn: new career");
+        let (t0, s) = (Instant::now(), Duration::from_secs);
+        let mut since = None;
+        assert!(turn_ok(Some(72), 72, &mut since, t0));
+        assert!(!turn_ok(Some(72), 1, &mut since, t0), "a reload's turn 1 is held back");
+        assert!(turn_ok(Some(72), 72, &mut since, t0 + s(1)) && since.is_none(), "back to the real turn");
+        assert!(!turn_ok(Some(72), 1, &mut since, t0 + s(2)));
+        assert!(!turn_ok(Some(72), 1, &mut since, t0 + s(11)));
+        assert!(turn_ok(Some(72), 2, &mut since, t0 + s(12)), "lower for 10 s: a new career");
+        assert!(turn_ok(None, 1, &mut None, t0), "nothing saved");
+
         assert_eq!(fmt_secs(1872.4), "31m 12s");
         assert_eq!(fmt_secs(3723.0), "1h 02m 03s");
     }

@@ -16,6 +16,11 @@ impl_addr_wrapper_fn!(
     name: *mut Il2CppString
 );
 
+// Global has only a 1-arg overload, so the 2-arg lookup is 0 there.
+pub fn has_prefab_attach_transform() -> bool {
+    unsafe { GET_PREFAB_ATTACH_TRANSFORM_ADDR != 0 }
+}
+
 type RaceUpdateCameraDistanceBlendRateFn = extern "C" fn(
     this: *mut Il2CppObject,
     p1: *mut Il2CppObject,

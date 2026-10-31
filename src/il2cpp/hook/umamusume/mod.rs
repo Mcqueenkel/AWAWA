@@ -107,7 +107,7 @@ mod LiveModelController;
 #[cfg(target_os = "windows")]
 pub mod ModelController;
 #[cfg(target_os = "windows")]
-mod RaceCameraManager;
+pub mod RaceCameraManager;
 #[cfg(target_os = "windows")]
 mod RaceCameraEventBase;
 #[cfg(target_os = "windows")]
@@ -196,6 +196,8 @@ pub mod MasterDataManager;
 pub mod MasterItemExchangeTop;
 mod SuperSkip;
 mod CareerTimer;
+mod RaceExport;
+mod WorkTrainedCharaData;
 pub mod SingleModeStartStepSuccessionSelect;
 
 pub fn init() {
@@ -349,6 +351,7 @@ pub fn init() {
     LiveTimeController::init(image);
     HomeViewController::init(image);
     WorkDataManager::init(image);
+    WorkTrainedCharaData::init(image);
     AssetManager::init(image);
     WorkJukeboxData::init(image);
     JukeboxBgmSelector::init(image);
@@ -361,5 +364,6 @@ pub fn init() {
     MasterDataManager::init(image);
     MasterItemExchangeTop::init(image);
     SuperSkip::init(image);
+    RaceExport::init(image);
     SingleModeStartStepSuccessionSelect::init(image);
 }

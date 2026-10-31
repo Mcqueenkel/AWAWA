@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Write as _,
     ops::RangeInclusive,
     os::raw::c_void,
@@ -402,6 +402,8 @@ const RACE_STAT_HUD_OPACITY_SCALE_MIN: f32 = 0.0;
 const RACE_STAT_HUD_OPACITY_SCALE_MAX: f32 = 1.0;
 
 const RACE_STAT_HUD_DRAG_SAVE_THRESHOLD: f32 = 6.0;
+// skill log entries kept, newest first
+const RACE_STAT_HUD_FEED_CAP: usize = 50;
 
 #[cfg(target_os = "windows")]
 fn windows_split_game_view(screen: egui::Rect, ppp: f32) -> Option<(egui::Rect, &'static str)> {
@@ -486,16 +488,28 @@ const ZENKAI_GLINT_PERIOD: f32 = 1.2;
 enum RaceStatHudTab {
     Stats,
     UsedSkills,
-    UnusedSkills
+    UnusedSkills,
+    Order,
+    SkillFeed
 }
 
 impl RaceStatHudTab {
-    fn display_list() -> [(RaceStatHudTab, Cow<'static, str>); 3] {
+    fn display_list() -> [(RaceStatHudTab, Cow<'static, str>); 5] {
         [
             (RaceStatHudTab::Stats, t!("race_stat_hud.stats")),
             (RaceStatHudTab::UsedSkills, t!("race_stat_hud.used_skills")),
-            (RaceStatHudTab::UnusedSkills, t!("race_stat_hud.unused_skills"))
+            (RaceStatHudTab::UnusedSkills, t!("race_stat_hud.unused_skills")),
+            (RaceStatHudTab::Order, t!("race_stat_hud.order_tab")),
+            (RaceStatHudTab::SkillFeed, t!("race_stat_hud.feed_tab"))
         ]
+    }
+
+    fn enabled(self, c: &hachimi::Config) -> bool {
+        match self {
+            Self::Order => c.race_stat_hud_order,
+            Self::SkillFeed => c.race_stat_hud_skill_feed,
+            _ => true
+        }
     }
 }
 
@@ -533,7 +547,8 @@ struct CharacterStats {
     finish_time_diff: f32,
     sim_events: SimEventStates,
     used_skill_ids: Vec<i32>,
-    all_skill_ids: Vec<i32>
+    all_skill_ids: Vec<i32>,
+    gate_no: i32
 }
 
 impl Default for CharacterStats {
@@ -572,7 +587,8 @@ impl Default for CharacterStats {
             finish_time_diff: 0.0,
             sim_events: SimEventStates::default(),
             used_skill_ids: Vec::new(),
-            all_skill_ids: Vec::new()
+            all_skill_ids: Vec::new(),
+            gate_no: 0
         }
     }
 }
@@ -600,7 +616,8 @@ struct RaceCourseInfo {
     course_distance: f32,
     phase_middle: f32,
     phase_end: f32,
-    phase_last: f32
+    phase_last: f32,
+    grade: i32
 }
 
 #[derive(Clone, Copy, Default)]
@@ -643,6 +660,9 @@ struct RaceStatHud {
     sim_events_buf: Vec<Vec<SimEvent>>,
     unused_skills_buf: Vec<i32>,
     chip_text: String,
+    // (stats index, skill id), newest first; only the main hud fills it
+    skill_feed: VecDeque<(usize, i32)>,
+    feed_seen: Vec<usize>,
     clones: Vec<RaceStatHud>,
     clone_seq: u32,
     spawn_clone: bool
@@ -673,6 +693,8 @@ impl RaceStatHud {
             sim_events_buf: Vec::new(),
             unused_skills_buf: Vec::new(),
             chip_text: String::new(),
+            skill_feed: VecDeque::new(),
+            feed_seen: Vec::new(),
             clones: Vec::new(),
             clone_seq: 0,
             spawn_clone: false
@@ -707,6 +729,8 @@ impl RaceStatHud {
             sim_events_buf: Vec::new(),
             unused_skills_buf: Vec::new(),
             chip_text: String::new(),
+            skill_feed: VecDeque::new(),
+            feed_seen: Vec::new(),
             clones: Vec::new(),
             clone_seq: seq,
             spawn_clone: false
@@ -864,6 +888,8 @@ impl RaceStatHud {
             hud.config = (**Hachimi::instance().config.load()).clone();
             hud.last_used_skills.clear();
             hud.last_unused_skills.clear();
+            hud.skill_feed.clear();
+            hud.feed_seen.clear();
             hud.select_player_on_race_start = true;
             hud.selected_character_dirty = false;
             if !hud.visible {
@@ -946,15 +972,18 @@ impl RaceStatHud {
 
         let can_add_clone = hud.clones.iter().filter(|c| c.visible).count() < 18;
 
+        // lent out like stats_buf, the guard can't split field borrows
+        let feed = std::mem::take(&mut hud.skill_feed);
         if !all_stats.is_empty() {
-            hud.run_hud(ctx, screen, game_view, panel, hud_scale, width_scale, height_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref());
+            hud.run_hud(ctx, screen, game_view, panel, hud_scale, width_scale, height_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref(), &feed);
             for clone in hud.clones.iter_mut() {
                 if clone.selected_character >= all_stats.len() {
                     clone.selected_character = all_stats.len() - 1;
                 }
-                clone.run_hud(ctx, screen, game_view, panel, hud_scale, width_scale, height_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref());
+                clone.run_hud(ctx, screen, game_view, panel, hud_scale, width_scale, height_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref(), &feed);
             }
         }
+        hud.skill_feed = feed;
         hud.stats_buf = all_stats;
 
         if (hud.config.race_stat_hud_persist_selected_index && hud.selected_character_dirty)
@@ -1156,6 +1185,7 @@ impl RaceStatHud {
         can_add_clone: bool,
         all_stats: &[CharacterStats],
         course_info: Option<&RaceCourseInfo>,
+        feed: &VecDeque<(usize, i32)>,
     ) {
         if !self.visible {
             return;
@@ -1229,7 +1259,7 @@ impl RaceStatHud {
                         ui.set_max_width(inner.x);
                         ui.set_min_height(inner.y);
 
-                        self.hud_contents(ui, all_stats, course_info, scale, inner.y, toggle_button, can_add_clone, draggable);
+                        self.hud_contents(ui, all_stats, course_info, scale, inner.y, toggle_button, can_add_clone, draggable, feed);
                     });
 
                 if resizable && !self.is_clone() {
@@ -1416,7 +1446,11 @@ impl RaceStatHud {
         });
     }
 
-    fn hud_contents(&mut self, ui: &mut egui::Ui, all_stats: &[CharacterStats], course: Option<&RaceCourseInfo>, scale: f32, panel_h: f32, toggle_button: bool, can_add_clone: bool, draggable_page: bool) {
+    fn hud_contents(&mut self, ui: &mut egui::Ui, all_stats: &[CharacterStats], course: Option<&RaceCourseInfo>, scale: f32, panel_h: f32, toggle_button: bool, can_add_clone: bool, draggable_page: bool, feed: &VecDeque<(usize, i32)>) {
+        let cfg = Hachimi::instance().config.load();
+        if !self.current_tab.enabled(&cfg) {
+            self.current_tab = RaceStatHudTab::Stats;
+        }
         let mut selected = self.selected_character;
         let mut visible = self.visible;
         let current_tab = self.current_tab;
@@ -1481,7 +1515,7 @@ impl RaceStatHud {
                         }
                     }
 
-                    if current_tab != RaceStatHudTab::Stats {
+                    if matches!(current_tab, RaceStatHudTab::UsedSkills | RaceStatHudTab::UnusedSkills) {
                         let mut autoscroll = match current_tab {
                             RaceStatHudTab::UsedSkills => self.config.race_stat_had_autoscroll_0,
                             RaceStatHudTab::UnusedSkills => self.config.race_stat_had_autoscroll_1,
@@ -1519,6 +1553,9 @@ impl RaceStatHud {
 
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                 for (tab, label) in RaceStatHudTab::display_list() {
+                    if !tab.enabled(&cfg) {
+                        continue;
+                    }
                     if ui.selectable_label(current_tab == tab, egui::RichText::new(label).size(13.0 * scale)).clicked() {
                         current_tab = tab;
                     }
@@ -1539,6 +1576,29 @@ impl RaceStatHud {
         });
         self.current_tab = current_tab;
 
+        // header chips, above the page so its height accounts for them
+        let order = if cfg.race_stat_hud_lead_gap || self.current_tab == RaceStatHudTab::Order {
+            Self::race_order(all_stats)
+        } else {
+            Vec::new()
+        };
+        let grade = if cfg.race_stat_hud_grade { course.and_then(|c| Self::grade_label(c.grade)) } else { None };
+        let lead = if cfg.race_stat_hud_lead_gap {
+            order.get(1).filter(|r| all_stats[r.0].cur_order >= 0).map(|r| r.1)
+        } else {
+            None
+        };
+        if grade.is_some() || lead.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(g) = &grade {
+                    Self::value_chip(ui, g, VALUE_CHIP_HUE_FINISH, scale);
+                }
+                if let Some(gap) = lead {
+                    Self::value_chip(ui, &t!("race_stat_hud.lead_gap", gap = format!("{gap:.1}")), VALUE_CHIP_HUE_ORDER, scale);
+                }
+            });
+        }
+
         ui.add_space(4.0 * scale);
 
         let used_h = ui.next_widget_position().y - ui.min_rect().min.y;
@@ -1548,7 +1608,9 @@ impl RaceStatHud {
         let page_base = match tab {
             RaceStatHudTab::Stats => "race_stat_hud_page_stats",
             RaceStatHudTab::UsedSkills => "race_stat_hud_page_used",
-            RaceStatHudTab::UnusedSkills => "race_stat_hud_page_unused"
+            RaceStatHudTab::UnusedSkills => "race_stat_hud_page_unused",
+            RaceStatHudTab::Order => "race_stat_hud_page_order",
+            RaceStatHudTab::SkillFeed => "race_stat_hud_page_feed"
         };
         let page_id = if self.clone_seq == 0 {
             egui::Id::new(page_base)
@@ -1597,6 +1659,8 @@ impl RaceStatHud {
                     RaceStatHudTab::UnusedSkills => {
                         self.skills_page(ui, &unused_ids, scale);
                     }
+                    RaceStatHudTab::Order => self.order_page(ui, all_stats, &order, scale),
+                    RaceStatHudTab::SkillFeed => self.feed_page(ui, all_stats, feed, scale)
                 };
 
                 if scroll_to_bottom {
@@ -2075,6 +2139,96 @@ impl RaceStatHud {
         });
     }
 
+    // stats indexes by the game's running order (unknown last) with the gap to the leader in metres
+    // ponytail: allocates per frame, at most 18 horses
+    fn race_order(all: &[CharacterStats]) -> Vec<(usize, f32)> {
+        let mut idx: Vec<usize> = (0..all.len()).collect();
+        idx.sort_by_key(|&i| (all[i].cur_order < 0, all[i].cur_order));
+        let lead = idx.first().map_or(0.0, |&i| all[i].distance);
+        idx.into_iter().map(|i| (i, (lead - all[i].distance).max(0.0))).collect()
+    }
+
+    // push newly used skills to the front of the feed
+    // ponytail: a shrinking list (slider seeking backward) just clears the feed
+    fn diff_used_skills(seen: &mut Vec<usize>, all: &[CharacterStats], feed: &mut VecDeque<(usize, i32)>) {
+        seen.resize(all.len(), 0);
+        if all.iter().zip(seen.iter()).any(|(s, &n)| s.used_skill_ids.len() < n) {
+            feed.clear();
+            for (n, s) in seen.iter_mut().zip(all) {
+                *n = s.used_skill_ids.len();
+            }
+            return;
+        }
+        for (i, (s, n)) in all.iter().zip(seen.iter_mut()).enumerate() {
+            for &id in &s.used_skill_ids[*n..] {
+                feed.push_front((i, id));
+            }
+            *n = s.used_skill_ids.len();
+        }
+        feed.truncate(RACE_STAT_HUD_FEED_CAP);
+    }
+
+    // values are the Gallop.RaceDefine.Grade constants
+    fn grade_label(g: i32) -> Option<Cow<'static, str>> {
+        Some(match g {
+            100 => "G1".into(),
+            200 => "G2".into(),
+            300 => "G3".into(),
+            400 => "OP".into(),
+            700 => t!("race_stat_hud.grade_pre_op"),
+            800 => t!("race_stat_hud.grade_maiden"),
+            900 => t!("race_stat_hud.grade_debut"),
+            _ => return None
+        })
+    }
+
+    fn order_page(&mut self, ui: &mut egui::Ui, all: &[CharacterStats], order: &[(usize, f32)], scale: f32) {
+        let selected = self.selected_character;
+        egui::Grid::new(ui.id().with("race_order")).num_columns(4).show(ui, |ui| {
+            for (rank, &(i, gap)) in order.iter().enumerate() {
+                let s = &all[i];
+                let known = s.cur_order >= 0;
+                let cell = |ui: &mut egui::Ui, text: &str| {
+                    let text = egui::RichText::new(text).size(12.0 * scale);
+                    ui.label(if i == selected { text.strong() } else { text });
+                };
+                if known {
+                    Self::ordinal_into(s.cur_order + 1, &mut self.chip_text);
+                } else {
+                    self.chip_text.clear();
+                    self.chip_text.push('-');
+                }
+                cell(ui, &self.chip_text);
+                cell(ui, &if s.gate_no > 0 { format!("#{}", s.gate_no) } else { String::new() });
+                cell(ui, &s.name);
+                cell(ui, &if rank == 0 || !known { "-".to_owned() } else { format!("+{gap:.1} m") });
+                ui.end_row();
+            }
+        });
+    }
+
+    fn feed_page(&mut self, ui: &mut egui::Ui, all: &[CharacterStats], feed: &VecDeque<(usize, i32)>, scale: f32) {
+        if feed.is_empty() {
+            ui.label(egui::RichText::new("-").size(12.0 * scale));
+            return;
+        }
+        for &(i, skill_id) in feed {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0 * scale, 4.0 * scale);
+                self.chip_text.clear();
+                match all.get(i) {
+                    Some(s) if s.gate_no > 0 => { let _ = write!(self.chip_text, "#{} {}", s.gate_no, s.name); }
+                    Some(s) => self.chip_text.push_str(&s.name),
+                    None => self.chip_text.push('?')
+                }
+                ui.label(egui::RichText::new(self.chip_text.as_str()).size(11.0 * scale).color(ui.visuals().weak_text_color()));
+                // hue follows the horse, so one horse keeps one colour
+                let (bg, border, text_color) = Self::skill_chip_colors(ui, i);
+                Gui::run_chip(ui, &self.skill_name(skill_id), bg, border, text_color, scale);
+            });
+        }
+    }
+
     fn skill_chip_colors(ui: &egui::Ui, index: usize) -> (egui::Color32, egui::Color32, egui::Color32) {
         Self::chip_colors(ui, SKILL_CHIP_HUES[index % SKILL_CHIP_HUES.len()])
     }
@@ -2188,6 +2342,10 @@ impl RaceStatHud {
             }
         }
 
+        if Hachimi::instance().config.load().race_stat_hud_skill_feed {
+            Self::diff_used_skills(&mut self.feed_seen, &all_stats, &mut self.skill_feed);
+        }
+
         (all_stats, Self::collect_course_info())
     }
 
@@ -2199,6 +2357,9 @@ impl RaceStatHud {
             return None;
         }
 
+        // computed getter, only called when the chip is on
+        let grade = if Hachimi::instance().config.load().race_stat_hud_grade { RaceInfo::grade(race_info) } else { 0 };
+
         if Hachimi::instance().game.region == Region::Global {
             let phase_calc = RaceInfo::get_PhaseCalc(race_info);
             if phase_calc.is_null() {
@@ -2209,7 +2370,8 @@ impl RaceStatHud {
                 course_distance: RaceInfo::get_CourseDistance(race_info) as f32,
                 phase_middle: RacePhaseCalculator::get_PhaseMiddleStartDistance(phase_calc),
                 phase_end: RacePhaseCalculator::get_PhaseEndStartDistance(phase_calc),
-                phase_last: RacePhaseCalculator::get_PhaseLastStartDistance(phase_calc)
+                phase_last: RacePhaseCalculator::get_PhaseLastStartDistance(phase_calc),
+                grade
             });
         }
 
@@ -2218,7 +2380,8 @@ impl RaceStatHud {
             course_distance: (RaceInfo::get_CourseOnlyDistance(race_info) + RaceInfo::get_RunUpDistance(race_info)) as f32,
             phase_middle: RaceInfo::get_PhaseMiddleStartDistance(race_info),
             phase_end: RaceInfo::get_PhaseEndStartDistance(race_info),
-            phase_last: RaceInfo::get_PhaseLastStartDistance(race_info)
+            phase_last: RaceInfo::get_PhaseLastStartDistance(race_info),
+            grade
         })
     }
 
@@ -2441,6 +2604,7 @@ impl RaceStatHud {
                 stats.name.push('?');
             }
         }
+        stats.gate_no = if !horse_data.is_null() { HorseData::get_GateNo(horse_data) } else { 0 };
 
         stats.player_name.clear();
         let trainer_name_ptr = if !horse_data.is_null() { HorseData::get_TrainerName(horse_data) } else { 0 as _ };
@@ -3709,6 +3873,8 @@ impl Gui {
         self.run_race_slider(&ctx);
         Self::run_race_playback_button(&ctx);
         RaceStatHud::run(&ctx);
+        #[cfg(target_os = "windows")]
+        Self::run_race_name_markers(&ctx);
         Self::run_affinity_overlay(&ctx);
 
         let has_interactive_widgets = IS_LIVE_SCENE.load(atomic::Ordering::Relaxed);
@@ -3794,7 +3960,7 @@ impl Gui {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(Self::icon(ctx));
-                    ui.heading("Hachimi");
+                    ui.heading(t!("hachimi"));
                     ui.label(env!("HACHIMI_DISPLAY_VERSION"));
                 });
                 ui.label(&self.splash_sub_str);
@@ -4538,6 +4704,25 @@ impl Gui {
         });
     }
 
+    // Name tags over each Uma; painter only, so no input is taken.
+    #[cfg(target_os = "windows")]
+    fn run_race_name_markers(ctx: &egui::Context) {
+        let Some(markers) = crate::il2cpp::hook::umamusume::RaceCameraManager::name_markers() else {
+            return;
+        };
+        let rect = RaceStatHud::game_view(ctx, ctx.viewport_rect()).0;
+        let scale = get_scale(ctx);
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("race_name_markers")));
+        let font = egui::FontId::proportional(12.0 * scale);
+        for m in markers {
+            let anchor = rect.min + egui::vec2(m.x * rect.width(), m.y * rect.height());
+            let galley = painter.layout_no_wrap(m.name, font.clone(), egui::Color32::WHITE);
+            let text_rect = egui::Align2::CENTER_BOTTOM.anchor_size(anchor, galley.size());
+            painter.rect_filled(text_rect.expand(3.0 * scale), 3.0 * scale, egui::Color32::from_black_alpha(150));
+            painter.galley(text_rect.min, galley, egui::Color32::WHITE);
+        }
+    }
+
     fn run_windows(&mut self) {
         self.windows.retain_mut(|w| w.run(&self.context));
     }
@@ -4554,6 +4739,7 @@ impl Gui {
             !Self::race_slider_showing() &&
             !Self::race_playback_button_showing() &&
             !free_camera::has_overlay_message() &&
+            !crate::il2cpp::hook::umamusume::RaceCameraManager::has_name_markers() &&
             !RaceStatHud::elements_showing() && !RaceStatHud::is_active() &&
             Self::affinity_overlay().is_none() &&
             !IS_CONSUMING_INPUT.load(atomic::Ordering::Acquire) &&
@@ -5375,13 +5561,14 @@ macro_rules! auto_skip_row {
         )
     };
 }
-const AUTO_SKIP_ROWS: [AutoSkipRow; 7] = [
+const AUTO_SKIP_ROWS: [AutoSkipRow; 8] = [
     auto_skip_row!(skip_training_cutin, false),
     auto_skip_row!(skip_story_events, false),
     auto_skip_row!(skip_story_everywhere, false),
     auto_skip_row!(skip_shop_performance, true),
     auto_skip_row!(skip_rival_entry, true),
     auto_skip_row!(skip_tag_cutin, true),
+    auto_skip_row!(skip_race_result_cutin, true),
     auto_skip_row!(skip_race_result_won, true)
 ];
 
@@ -6239,6 +6426,18 @@ impl ConfigEditor {
                 ui.end_row();
             }
 
+            if should_show_option(search, &t!("config_editor.save_race_data")) {
+                ui.label(t!("config_editor.save_race_data")).on_hover_text(t!("config_editor.save_race_data_desc"));
+                ui.checkbox(&mut config.save_race_data, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.save_trained_umas")) {
+                ui.label(t!("config_editor.save_trained_umas")).on_hover_text(t!("config_editor.save_trained_umas_desc"));
+                ui.checkbox(&mut config.save_trained_umas, "");
+                ui.end_row();
+            }
+
             if should_show_option(search, &t!("config_editor.force_allow_dynamic_camera")) {
                 ui.label(t!("config_editor.force_allow_dynamic_camera"));
                 ui.checkbox(&mut config.force_allow_dynamic_camera, "");
@@ -6247,7 +6446,7 @@ impl ConfigEditor {
 
             #[cfg(target_os = "windows")]
             {
-                if should_show_option(search, &t!("config_editor.free_camera")) && Hachimi::instance().game.region != Region::Global {
+                if should_show_option(search, &t!("config_editor.free_camera")) {
                     ui.label(t!("config_editor.free_camera"));
                     ui.checkbox(&mut config.windows.free_camera.enabled, "");
                     ui.end_row();
@@ -6278,6 +6477,12 @@ impl ConfigEditor {
                         }
                         ui.end_row();
                     }
+                }
+
+                if should_show_option(search, &t!("config_editor.race_name_markers")) {
+                    ui.label(t!("config_editor.race_name_markers"));
+                    ui.checkbox(&mut config.windows.race_name_markers, "");
+                    ui.end_row();
                 }
             }
 
@@ -6538,6 +6743,34 @@ impl ConfigEditor {
                 && config.race_stat_hud {
                 ui.label(t!("config_editor.race_stat_hud_persist_selected_index"));
                 ui.checkbox(&mut config.race_stat_hud_persist_selected_index, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.race_stat_hud_order")) && matches!(Hachimi::instance().game.region, Region::Japan | Region::Global)
+                && config.race_stat_hud {
+                ui.label(t!("config_editor.race_stat_hud_order"));
+                ui.checkbox(&mut config.race_stat_hud_order, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.race_stat_hud_lead_gap")) && matches!(Hachimi::instance().game.region, Region::Japan | Region::Global)
+                && config.race_stat_hud {
+                ui.label(t!("config_editor.race_stat_hud_lead_gap"));
+                ui.checkbox(&mut config.race_stat_hud_lead_gap, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.race_stat_hud_skill_feed")) && matches!(Hachimi::instance().game.region, Region::Japan | Region::Global)
+                && config.race_stat_hud {
+                ui.label(t!("config_editor.race_stat_hud_skill_feed"));
+                ui.checkbox(&mut config.race_stat_hud_skill_feed, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.race_stat_hud_grade")) && matches!(Hachimi::instance().game.region, Region::Japan | Region::Global)
+                && config.race_stat_hud {
+                ui.label(t!("config_editor.race_stat_hud_grade"));
+                ui.checkbox(&mut config.race_stat_hud_grade, "");
                 ui.end_row();
             }
 
@@ -7414,8 +7647,8 @@ fn save_and_reload_config(config: hachimi::Config) {
             {
                 if Hachimi::instance().game.region != Region::Global {
                     crate::windows::wnd_hook::apply_freeform_window_config();
-                    free_camera::reload_runtime_config();
                 }
+                free_camera::reload_runtime_config();
             }
             t!("notification.config_saved").into_owned()
         },
@@ -8189,6 +8422,19 @@ impl Window for FreeCameraSettingsWindow {
                                 ui.add(egui::DragValue::new(&mut cfg.race_target_index).speed(1.0).range(-1..=17));
                                 ui.end_row();
 
+                                ui.label(t!("free_camera.race_extras"));
+                                ui.checkbox(&mut cfg.race_extras, "");
+                                ui.end_row();
+
+                                // saved views live in their own file; Delete applies at once
+                                for (track, count) in free_camera::race_view_counts() {
+                                    ui.label(t!("free_camera.race_views_track", track = track, count = count));
+                                    if ui.button(t!("free_camera.race_views_delete")).clicked() {
+                                        free_camera::delete_race_views(track);
+                                    }
+                                    ui.end_row();
+                                }
+
                                 ui.vertical(|ui| {
                                     ui.add_space(8.0 * scale);
                                     ui.heading(t!("free_camera.section_keybinds"));
@@ -8235,6 +8481,10 @@ impl Window for FreeCameraSettingsWindow {
                                 keybind_row!(reset, "free_camera.key_reset");
                                 keybind_row!(cycle_mode, "free_camera.key_cycle_mode");
                                 keybind_row!(reverse, "free_camera.key_reverse");
+                                keybind_row!(orbit_left, "free_camera.key_orbit_left");
+                                keybind_row!(orbit_right, "free_camera.key_orbit_right");
+                                keybind_row!(view_save, "free_camera.key_view_save");
+                                keybind_row!(view_next, "free_camera.key_view_next");
 
                                 ui.horizontal(|ui| ui.add_space(130.0 * scale));
                                 ui.horizontal(|ui| ui.add_space(130.0 * scale));
@@ -10108,5 +10358,44 @@ impl Window for HachimiUpdateWindow {
             }
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod race_hud_tests {
+    use super::*;
+
+    fn horse(cur_order: i32, distance: f32, used: &[i32]) -> CharacterStats {
+        CharacterStats { cur_order, distance, used_skill_ids: used.to_vec(), ..Default::default() }
+    }
+
+    #[test]
+    fn race_hud_order_and_skill_feed() {
+        // CurOrder order, unknown (-1) last, gaps from the leader
+        let all = [horse(1, 95.0, &[]), horse(-1, 0.0, &[]), horse(0, 100.0, &[])];
+        assert_eq!(RaceStatHud::race_order(&all), vec![(2, 0.0), (0, 5.0), (1, 100.0)]);
+
+        let mut seen = Vec::new();
+        let mut feed = VecDeque::new();
+        let mut all = vec![horse(0, 0.0, &[10]), horse(1, 0.0, &[])];
+        RaceStatHud::diff_used_skills(&mut seen, &all, &mut feed);
+        assert_eq!(feed, [(0, 10)]);
+        RaceStatHud::diff_used_skills(&mut seen, &all, &mut feed);
+        assert_eq!(feed.len(), 1);
+
+        all[0].used_skill_ids.push(11);
+        all[1].used_skill_ids.push(20);
+        RaceStatHud::diff_used_skills(&mut seen, &all, &mut feed);
+        assert_eq!(feed, [(1, 20), (0, 11), (0, 10)]);
+
+        // backward seek
+        all[0].used_skill_ids.clear();
+        RaceStatHud::diff_used_skills(&mut seen, &all, &mut feed);
+        assert!(feed.is_empty());
+
+        all[0].used_skill_ids = (0..100).collect();
+        RaceStatHud::diff_used_skills(&mut seen, &all, &mut feed);
+        assert_eq!(feed.len(), RACE_STAT_HUD_FEED_CAP);
+        assert_eq!(feed[0], (0, 99));
     }
 }

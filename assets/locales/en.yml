@@ -1,4 +1,4 @@
-hachimi: "Hachimi Edge"
+hachimi: "AWAWA"
 
 windows:
   menu_open_key: "Right arrow"
@@ -294,11 +294,18 @@ config_editor:
   skip_rival_entry_desc: "Skips the rival intro on the career race entry screen. Paddock intros are left alone. Risky: may stall race entry."
   skip_tag_cutin: "Skip friendship training animations"
   skip_tag_cutin_desc: "Skips the support card tag cut-in on the training screen. Risky: may stall the training screen."
+  skip_race_result_cutin: "Skip race result pose"
+  skip_race_result_cutin_desc: "After View Results in a career race, taps through the win or lose pose as soon as the game allows it. The placing still shows on the result list. Risky: may stall the paddock."
   skip_race_result_won: "Skip results of won races"
-  skip_race_result_won_desc: "After a career race you won, taps through the result screens for you. Never acts on losses, team races or other modes. Risky: can soft-lock, more so with event skipping on."
+  skip_race_result_won_desc: "After a career race you won, watched or with View Results, presses Next on the result screens for you. Never acts on losses, team races or other modes. Risky: can soft-lock, more so with event skipping on."
   force_allow_dynamic_camera: "Force allow dynamic camera"
   affinity_overlay: "Show Legacy affinity points"
+  save_race_data: "Save race data files"
+  save_race_data_desc: "After each race, writes a JSON file with the race's basic details and the game's replay data to hachimi/race_data/. Stays on this PC. No player names or IDs are saved."
+  save_trained_umas: "Save my trained Umas"
+  save_trained_umas_desc: "Writes your own trained Umas (stats, aptitudes, skills, sparks, parents, race wins) to hachimi/trained_umas_<id>.json whenever the game loads or updates the list. Local file only. Borrowed Umas are left out."
   free_camera: "Free Camera"
+  race_name_markers: "Name tags over Umas in races"
   live_theater_allow_same_chara: "Live theater allow same chara"
   physics_update_mode: "Physics update mode"
   cyspring_mono_uncap_frame_scale: "CySpring Mono Frame Scale Uncap"
@@ -323,6 +330,10 @@ config_editor:
   race_stat_hud_opacity_scale: "Race Stat HUD opacity scale"
   race_stat_hud_persist_clones: "Race Stat HUD persist clones"
   race_stat_hud_persist_selected_index: "Race Stat HUD save selected character(s)"
+  race_stat_hud_order: "Race Stat HUD running order tab"
+  race_stat_hud_lead_gap: "Race Stat HUD lead margin (1st to 2nd)"
+  race_stat_hud_skill_feed: "Race Stat HUD skill log tab"
+  race_stat_hud_grade: "Race Stat HUD race grade"
   race_playback_slider: "Race Playback Slider"
   race_playback_slider_always: "Always show Race Playback Slider"
   race_playback_button: "Race playback pause/resume button"
@@ -417,6 +428,12 @@ race_stat_hud:
   used_skills: "Used Skills"
   unused_skills: "Unused Skills"
   autoscroll: "Autoscroll"
+  order_tab: "Order"
+  feed_tab: "Skill Log"
+  lead_gap: "Lead %{gap} m"
+  grade_pre_op: "Pre-OP"
+  grade_maiden: "Maiden"
+  grade_debut: "Debut"
   phase_runup: "Run-up"
   phase_start: "Opening Leg"
   phase_middle: "Middle Leg"
@@ -485,6 +502,12 @@ free_camera:
   race_follow_offset: "Race follow offset"
   race_follow_distance: "Race follow distance"
   race_first_person_lookat_offset: "Race look-at offset"
+  race_extras: "Orbit keys and saved views per track"
+  race_views_track: "Track %{track}: %{count} saved view(s)"
+  race_views_delete: "Delete"
+  overlay_view_saved: "Saved view %{index} for track %{track}"
+  overlay_view: "View %{index} of %{count}"
+  overlay_no_views: "No saved views for track %{track}"
   overlay_mode: "Mode: %{mode}"
   overlay_target: "Target: %{target}"
   overlay_part: "Part: %{part}"
@@ -513,6 +536,10 @@ free_camera:
   key_reset: "Reset camera position"
   key_cycle_mode: "Cycle mode"
   key_reverse: "Flip follow camera perspective (front <-> back)"
+  key_orbit_left: "Orbit left around the followed Uma"
+  key_orbit_right: "Orbit right around the followed Uma"
+  key_view_save: "Save camera view for this track"
+  key_view_next: "Next saved view for this track"
   cheatsheet_title: "Free Camera Cheatsheet"
   cheatsheet_contents: |
     # Free Camera Cheatsheet
@@ -553,6 +580,17 @@ free_camera:
     * **D-Pad Left:** Previous target *(Follow Camera & First Person)*
     * **D-Pad Up:** Next body part *(Follow Camera only)*
     * **D-Pad Down:** Previous body Part *(Follow Camera only)*
+
+    ---
+
+    ## Race extras (when enabled in settings)
+    * **U / O:** Orbit around the followed Uma *(Follow Character only)*
+    * **N:** Save the current camera as a view for this track
+    * **M:** Switch to the next saved view for this track
+
+    View 1 is used when a race on that track starts.
+
+    On Global only races are supported.
 
 excludes_editor:
   title: "Excludes Editor"

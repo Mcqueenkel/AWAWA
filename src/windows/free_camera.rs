@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ptr::null_mut,
     sync::{Mutex, atomic::{AtomicBool, Ordering}},
     time::Instant,
@@ -11,7 +11,7 @@ use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    core::{gui, Hachimi}, il2cpp::{
+    core::{game::Region, gui, utils, Hachimi}, il2cpp::{
         ext::Il2CppStringExt,
         hook::{
             UnityEngine_CoreModule::{Component, GameObject, Object, Transform},
@@ -21,7 +21,7 @@ use crate::{
                 LEFT_SHOULDER, RIGHT_SHOULDER,
                 BUTTON_SOUTH, BUTTON_EAST, BUTTON_WEST, BUTTON_NORTH,
             },
-            umamusume::ModelController,
+            umamusume::{ModelController, RaceInfo, RaceManager},
         },
         symbols::IEnumerable,
         types::*,
@@ -122,6 +122,21 @@ impl Default for Vec3Config {
     }
 }
 
+// One saved race camera, stored per track in race_camera_views.json.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct RaceCameraView {
+    mode: FreeCameraMode,
+    pos: Vec3Config,
+    yaw: f32,
+    pitch: f32,
+    fov: f32,
+    follow_offset: Vec3Config,
+    follow_distance: f32,
+    lookat_offset: Vec3Config,
+    orbit_yaw: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FreeCameraKeybinds {
@@ -148,6 +163,10 @@ pub struct FreeCameraKeybinds {
     pub reset: u16,
     pub cycle_mode: u16,
     pub reverse: u16,
+    pub orbit_left: u16,
+    pub orbit_right: u16,
+    pub view_save: u16,
+    pub view_next: u16,
 }
 
 impl Default for FreeCameraKeybinds {
@@ -177,6 +196,10 @@ impl Default for FreeCameraKeybinds {
             reset: VK_R.0,             // R
             cycle_mode: VK_F.0,        // F
             reverse: VK_V.0,           // V
+            orbit_left: VK_U.0,        // U
+            orbit_right: VK_O.0,       // O
+            view_save: VK_N.0,         // N
+            view_next: VK_M.0,         // M
         }
     }
 }
@@ -215,6 +238,7 @@ pub struct FreeCameraConfig {
     pub gamepad_deadzone: f32,
     pub gamepad_move_speed: f32,
     pub gamepad_look_speed: f32,
+    pub race_extras: bool,
     pub keybinds: FreeCameraKeybinds,
 }
 
@@ -252,6 +276,7 @@ impl Default for FreeCameraConfig {
             gamepad_deadzone: 0.18,
             gamepad_move_speed: 1.0,
             gamepad_look_speed: 1.0,
+            race_extras: false,
             keybinds: FreeCameraKeybinds::default(),
         }
     }
@@ -279,6 +304,10 @@ impl Vec3 {
 
     fn from_config(value: Vec3Config) -> Self {
         Self::new(value.x, value.y, value.z)
+    }
+
+    fn to_config(self) -> Vec3Config {
+        Vec3Config::new(self.x, self.y, self.z)
     }
 
     fn len(self) -> f32 {
@@ -469,6 +498,8 @@ struct KeyState {
     follow_offset_down: bool,
     follow_offset_left: bool,
     follow_offset_right: bool,
+    orbit_left: bool,
+    orbit_right: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -514,6 +545,9 @@ struct FreeCameraState {
     race_target: Vec3,
     race_target_rot: Quat,
     race_target_seen: bool,
+    race_orbit_yaw: f32,
+    race_track_id: Option<i32>,
+    race_view_index: Option<usize>,
     key_state: KeyState,
     gamepad: GamepadState,
     right_mouse_down: bool,
@@ -566,6 +600,9 @@ impl FreeCameraState {
             race_target: Vec3::default(),
             race_target_rot: Quat { w: 1.0, x: 0.0, y: 0.0, z: 0.0 },
             race_target_seen: false,
+            race_orbit_yaw: 0.0,
+            race_track_id: None,
+            race_view_index: None,
             key_state: KeyState::default(),
             gamepad: GamepadState::default(),
             right_mouse_down: false,
@@ -616,6 +653,7 @@ impl FreeCameraState {
         }
 
         self.race_target_seen = false;
+        self.race_orbit_yaw = 0.0;
         self.camera_rotation = None;
         self.key_state = KeyState::default();
         self.right_mouse_down = false;
@@ -665,6 +703,7 @@ impl FreeCameraState {
                 self.live_selfie_last_head_pos = None;
                 self.live_selfie_stabilized_target = None;
                 if self.scene == CameraScene::Race {
+                    self.race_orbit_yaw = 0.0;
                     if config.selfie_use_head_transform {
                         self.race_follow_offset = Vec3::new(0.0, 0.0, -2.0);
                         self.race_follow_distance = 0.0;
@@ -699,8 +738,17 @@ impl FreeCameraState {
     }
 
     fn set_scene(&mut self, scene: CameraScene, config: &FreeCameraConfig) {
+        // ponytail: upstream hid freecam on Global; only races are unlocked there
+        let scene = if scene == CameraScene::Live && Hachimi::instance().game.region == Region::Global {
+            CameraScene::None
+        }
+        else {
+            scene
+        };
         if self.scene != scene {
             self.scene = scene;
+            self.race_track_id = None;
+            self.race_view_index = None;
             self.reset_with_config(config);
         }
     }
@@ -723,6 +771,35 @@ static OVERLAY_MESSAGE: Lazy<Mutex<Option<OverlayMessage>>> = Lazy::new(|| Mutex
 static RELOAD_CONFIG_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LIVE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 static TOGGLE_LIVE_PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+// Saved race views by track id, loaded on first use. Lock order: STATE, then RACE_VIEWS.
+static RACE_VIEWS: Mutex<Option<BTreeMap<i32, Vec<RaceCameraView>>>> = Mutex::new(None);
+
+// ponytail: sync small JSON read/write on the calling thread; move to a worker if it hitches
+fn with_race_views<R>(save: bool, f: impl FnOnce(&mut BTreeMap<i32, Vec<RaceCameraView>>) -> R) -> R {
+    let path = Hachimi::instance().get_data_path("race_camera_views.json");
+    let mut views = RACE_VIEWS.lock().unwrap();
+    let map = views.get_or_insert_with(|| {
+        std::fs::read_to_string(&path).ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    });
+    let res = f(map);
+    if save {
+        if let Err(e) = utils::write_json_file(map, &path) {
+            error!("race camera views: {}", e);
+        }
+    }
+    res
+}
+
+pub fn race_view_counts() -> Vec<(i32, usize)> {
+    with_race_views(false, |map| map.iter().map(|(track, list)| (*track, list.len())).collect())
+}
+
+pub fn delete_race_views(track: i32) {
+    with_race_views(true, |map| { map.remove(&track); });
+}
 
 thread_local! {
     static LIVE_SECONDARY_CAMERA_UPDATE_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -1507,16 +1584,72 @@ fn update_race_follow_locked(state: &mut FreeCameraState) {
     };
     let right = Vec3::new(forward.z, 0.0, -forward.x).normalized();
     let offset = state.race_follow_offset;
+    let lookat = state.race_first_person_lookat_offset;
+    // orbit around the target; yaw 0 is the plain follow camera
+    let orbit = Quat { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
+        .rotate_axis(state.race_orbit_yaw, Vec3::new(0.0, 1.0, 0.0));
     state.camera_pos =
         state.race_target +
-        right * offset.x +
-        Vec3::new(0.0, offset.y, 0.0) +
-        forward * (offset.z + state.race_follow_distance);
+        orbit.rotate_vec(right * offset.x + forward * (offset.z + state.race_follow_distance)) +
+        Vec3::new(0.0, offset.y, 0.0);
     state.camera_look_at =
         state.race_target +
-        right * state.race_first_person_lookat_offset.x +
-        Vec3::new(0.0, state.race_first_person_lookat_offset.y, 0.0);
+        orbit.rotate_vec(right * lookat.x) +
+        Vec3::new(0.0, lookat.y, 0.0);
     state.camera_rotation = None;
+}
+
+fn capture_view(state: &FreeCameraState) -> RaceCameraView {
+    RaceCameraView {
+        mode: state.mode,
+        pos: state.camera_pos.to_config(),
+        yaw: state.yaw,
+        pitch: state.pitch,
+        fov: state.race_fov,
+        follow_offset: state.race_follow_offset.to_config(),
+        follow_distance: state.race_follow_distance,
+        lookat_offset: state.race_first_person_lookat_offset.to_config(),
+        orbit_yaw: state.race_orbit_yaw,
+    }
+}
+
+fn apply_view(state: &mut FreeCameraState, view: &RaceCameraView) {
+    state.mode = view.mode;
+    state.camera_pos = Vec3::from_config(view.pos);
+    state.yaw = view.yaw;
+    state.pitch = view.pitch;
+    state.race_fov = view.fov.clamp(1.0, 120.0);
+    state.race_follow_offset = Vec3::from_config(view.follow_offset);
+    state.race_follow_distance = view.follow_distance;
+    state.race_first_person_lookat_offset = Vec3::from_config(view.lookat_offset);
+    state.race_orbit_yaw = view.orbit_yaw;
+    state.update_look_from_angles();
+    state.camera_rotation = None;
+    state.last_overlay_mode = view.mode;
+}
+
+fn save_view_locked(state: &FreeCameraState) {
+    let Some(track) = state.race_track_id else { return };
+    let view = capture_view(state);
+    let count = with_race_views(true, |map| {
+        let list = map.entry(track).or_default();
+        list.push(view);
+        list.len()
+    });
+    set_overlay_message(t!("free_camera.overlay_view_saved", index = count, track = track).into_owned());
+}
+
+fn next_view_locked(state: &mut FreeCameraState) {
+    let Some(track) = state.race_track_id else { return };
+    let list = with_race_views(false, |map| map.get(&track).cloned()).unwrap_or_default();
+    if list.is_empty() {
+        set_overlay_message(t!("free_camera.overlay_no_views", track = track).into_owned());
+        return;
+    }
+    let index = state.race_view_index.map_or(0, |i| (i + 1) % list.len());
+    state.race_view_index = Some(index);
+    apply_view(state, &list[index]);
+    set_overlay_message(t!("free_camera.overlay_view", index = index + 1, count = list.len()).into_owned());
 }
 
 pub fn slerp_quaternion(a: Quaternion_t, b: Quaternion_t, t: f32) -> Quaternion_t {
@@ -1547,6 +1680,10 @@ pub fn on_windows_key(vk: u16, pressed: bool, repeat: bool) {
     let kb = &config.windows.free_camera.keybinds;
     let mut state = STATE.lock().unwrap();
     set_key_flag(&mut state.key_state, vk, pressed, kb);
+    // STATE is held: use state.scene, never scene()
+    let race_extras = config.windows.free_camera.race_extras && state.scene == CameraScene::Race;
+    if vk == kb.orbit_left { state.key_state.orbit_left = pressed && race_extras; }
+    if vk == kb.orbit_right { state.key_state.orbit_right = pressed && race_extras; }
 
     if !pressed || repeat {
         return;
@@ -1573,6 +1710,12 @@ pub fn on_windows_key(vk: u16, pressed: bool, repeat: bool) {
     else if vk == kb.part_next {
         next_live_part_locked(&mut state);
     }
+    else if race_extras && vk == kb.view_save {
+        save_view_locked(&state);
+    }
+    else if race_extras && vk == kb.view_next {
+        next_view_locked(&mut state);
+    }
 }
 
 pub fn is_windows_key_bound(vk: u16) -> bool {
@@ -1582,6 +1725,10 @@ pub fn is_windows_key_bound(vk: u16) -> bool {
 
     let config = Hachimi::instance().config.load();
     let kb = &config.windows.free_camera.keybinds;
+    let race_key = vk == kb.orbit_left || vk == kb.orbit_right || vk == kb.view_save || vk == kb.view_next;
+    if race_key && config.windows.free_camera.race_extras && scene() == CameraScene::Race {
+        return true;
+    }
     vk == kb.move_forward ||
         vk == kb.move_back ||
         vk == kb.move_left ||
@@ -1649,7 +1796,9 @@ pub fn wants_windows_input_capture() -> bool {
         state.key_state.follow_offset_up ||
         state.key_state.follow_offset_down ||
         state.key_state.follow_offset_left ||
-        state.key_state.follow_offset_right
+        state.key_state.follow_offset_right ||
+        state.key_state.orbit_left ||
+        state.key_state.orbit_right
 }
 
 pub fn on_mouse_button(right_down: bool) {
@@ -1713,6 +1862,17 @@ pub fn tick() {
     if !matches!(state.scene, CameraScene::Live | CameraScene::Race) {
         state.last_tick = Instant::now();
         return;
+    }
+    // Read the track once per race and apply its first saved view. Runs after the reset above,
+    // so the view survives it. get_RaceInfo and get_RaceTrackId are plain unhooked getters.
+    if state.scene == CameraScene::Race && config.race_extras && state.race_track_id.is_none() {
+        state.race_track_id = RaceInfo::race_track_id(RaceManager::get_RaceInfo());
+        let first = state.race_track_id
+            .and_then(|track| with_race_views(false, |map| map.get(&track).and_then(|list| list.first().copied())));
+        if let Some(view) = first {
+            state.race_view_index = Some(0);
+            apply_view(&mut state, &view);
+        }
     }
     if state.scene == CameraScene::Race && state.mode != state.last_overlay_mode {
         state.last_overlay_mode = state.mode;
@@ -1780,6 +1940,10 @@ fn apply_input_locked(
     }
     if state.key_state.follow_offset_right {
         adjust_follow_offset_x_locked(state, -move_step * 10.0);
+    }
+    if config.race_extras && state.scene == CameraScene::Race && state.mode == FreeCameraMode::SelfieStick {
+        let orbit = bool_axis(state.key_state.orbit_left, state.key_state.orbit_right);
+        state.race_orbit_yaw = (state.race_orbit_yaw + orbit * look_step).rem_euclid(360.0);
     }
 
     if forward.abs() > f32::EPSILON {

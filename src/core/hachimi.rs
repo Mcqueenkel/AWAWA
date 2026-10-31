@@ -855,6 +855,8 @@ pub struct Config {
     #[serde(default)]
     pub skip_race_result_won: bool,
     #[serde(default)]
+    pub skip_race_result_cutin: bool, // the result pose after "View Results"
+    #[serde(default)]
     pub enable_ipc: bool,
     #[serde(default)]
     pub ipc_listen_all: bool,
@@ -932,6 +934,14 @@ pub struct Config {
     #[serde(default = "Config::default_race_stat_hud_opacity_scale")]
     pub race_stat_hud_opacity_scale: f32,
     #[serde(default)]
+    pub race_stat_hud_order: bool,
+    #[serde(default)]
+    pub race_stat_hud_lead_gap: bool,
+    #[serde(default)]
+    pub race_stat_hud_skill_feed: bool,
+    #[serde(default)]
+    pub race_stat_hud_grade: bool,
+    #[serde(default)]
     pub race_playback_slider: bool,
     #[serde(default = "Config::default_true")]
     pub race_playback_slider_always: bool,
@@ -943,6 +953,10 @@ pub struct Config {
     pub affinity_overlay: bool,
     #[serde(default)]
     pub affinity_overlay_pos: Option<[f32; 2]>,
+    #[serde(default)]
+    pub save_race_data: bool, // il2cpp/hook/umamusume/RaceExport.rs
+    #[serde(default)]
+    pub save_trained_umas: bool, // il2cpp/hook/umamusume/WorkTrainedCharaData.rs
     #[serde(flatten)]
     pub caption: CaptionConfig,
     #[serde(default)]

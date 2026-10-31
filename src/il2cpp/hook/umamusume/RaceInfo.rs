@@ -6,6 +6,19 @@ use crate::{
 def_method_wrapper_fn!(get_RaceType, GET_RACETYPE_ADDR, i32, this: *mut Il2CppObject);
 def_method_wrapper_fn!(set_RaceType, SET_RACETYPE_ADDR, (), this: *mut Il2CppObject, value: i32);
 def_method_wrapper_fn!(get_IsStoryRace, GET_IS_STORY_RACE_ADDR, bool, this: *mut Il2CppObject);
+def_method_wrapper_fn!(get_Grade, GET_GRADE_ADDR, i32, this: *mut Il2CppObject);
+
+// RaceDefine.Grade value, 0 when the getter is missing
+pub fn grade(this: *mut Il2CppObject) -> i32 {
+    if unsafe { GET_GRADE_ADDR } == 0 { 0 } else { get_Grade(this) }
+}
+
+def_method_wrapper_fn!(get_RaceTrackId, GET_RACE_TRACK_ID_ADDR, i32, this: *mut Il2CppObject);
+
+pub fn race_track_id(this: *mut Il2CppObject) -> Option<i32> {
+    (!this.is_null() && unsafe { GET_RACE_TRACK_ID_ADDR } != 0).then(|| get_RaceTrackId(this))
+}
+
 def_method_wrapper_fn!(get_CourseOnlyDistance, GET_COURSE_ONLY_DISTANCE_ADDR, i32, this: *mut Il2CppObject);
 def_method_wrapper_fn!(get_RunUpDistance, GET_RUN_UP_DISTANCE_ADDR, i32, this: *mut Il2CppObject);
 def_method_wrapper_fn!(get_CourseDistance, GET_COURSE_DISTANCE_ADDR, i32, this: *mut Il2CppObject);
@@ -21,6 +34,8 @@ pub fn init(umamusume: *const Il2CppImage) {
         GET_RACETYPE_ADDR = get_method_addr(RaceInfo, c"get_RaceType", 0);
         SET_RACETYPE_ADDR = get_method_addr(RaceInfo, c"set_RaceType", 1);
         GET_IS_STORY_RACE_ADDR = get_method_addr(RaceInfo, c"get_IsStoryRace", 0);
+        GET_GRADE_ADDR = get_method_addr(RaceInfo, c"get_Grade", 0);
+        GET_RACE_TRACK_ID_ADDR = get_method_addr(RaceInfo, c"get_RaceTrackId", 0);
 
         match Hachimi::instance().game.region {
             Region::Global => {

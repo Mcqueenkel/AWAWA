@@ -4,23 +4,26 @@
 use std::{
     ffi::CStr,
     ptr::null_mut,
-    sync::{atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering}, Mutex, MutexGuard, OnceLock},
+    sync::{atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering}, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant}
 };
 
 use crate::{
     core::Hachimi,
     il2cpp::{
-        api::{il2cpp_class_is_subclass_of, il2cpp_object_new, il2cpp_runtime_invoke},
+        api::{
+            il2cpp_class_get_element_class, il2cpp_class_get_rank, il2cpp_class_get_type, il2cpp_class_is_subclass_of,
+            il2cpp_field_get_flags, il2cpp_field_get_type, il2cpp_object_new, il2cpp_runtime_invoke, il2cpp_type_get_type
+        },
         ext::{Il2CppObjectExt, Il2CppStringExt},
         hook::UnityEngine_CoreModule::{GameObject, Object},
-        symbols::{get_field_from_name, get_field_object_value, get_field_value, get_method, get_method_addr, get_method_cached, get_static_field_value, invoke_object_method, unbox, Array, GCHandle, IEnumerator, MoveNextFn},
+        symbols::{find_nested_class, get_field_from_name, get_field_object_value, get_field_value, get_method, get_method_addr, get_method_cached, get_static_field_value, invoke_object_method, unbox, Array, GCHandle, IEnumerator, MoveNextFn},
         types::*
     }
 };
 use super::{DialogManager, HorseRaceInfo, RaceHorseManagerBase, RaceManager, SceneDefine::SceneId, SceneManager};
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -152,6 +155,9 @@ extern "C" fn StoryView_OnStartPlayingTimeline(this: *mut Il2CppObject) {
     STORY_PENDING.store(true, Ordering::Release);
 }
 
+static mut STORY_PLAY_MODE_FIELD: *mut FieldInfo = null_mut(); // StoryTimelineController.CurrentPlayMode
+static STORY_PLAY_MODE_GRAND_LIVE: AtomicI32 = AtomicI32::new(i32::MIN); // PlayMode.GrandLive
+
 static TICKS: AtomicU32 = AtomicU32::new(0);
 
 // Main thread, every frame (GameSystem::Update).
@@ -161,6 +167,7 @@ pub fn tick() {
     tick_shop(tick);
     tick_story();
     tick_race_result();
+    tick_paddock();
     tick_trace();
 }
 
@@ -200,6 +207,14 @@ fn tick_story() {
     }
     let Some(timeline) = invoke_object_method(view, c"get_TimelineController", 0, &mut []) else { return };
     let playing = !timeline.is_null() && invoke_get::<bool>(timeline, c"get_IsPlaying") == Some(true);
+    // A Grand Live story (the finale, shown with "All goals achieved") waits for the Live button;
+    // skipping it soft-locks the career, on any screen.
+    let grand_live = !timeline.is_null()
+        && get_field_value::<i32>(timeline, unsafe { STORY_PLAY_MODE_FIELD }) == STORY_PLAY_MODE_GRAND_LIVE.load(Ordering::Relaxed);
+    if grand_live {
+        info!("superskip: Grand Live story left alone");
+        return;
+    }
     let training_cutt = invoke_get::<bool>(view, c"get_IsPlayingOrWillPlayTrainingCutt").unwrap_or(true);
     let since_skip = last_skip.map(|t| started.saturating_duration_since(t));
 
@@ -576,7 +591,7 @@ fn race_won(race_type: i32, single: i32, rank_1st: i32, player: usize, orders: i
     first
 }
 
-fn invoke_get<T: Copy>(obj: *mut Il2CppObject, name: &CStr) -> Option<T> {
+pub(super) fn invoke_get<T: Copy>(obj: *mut Il2CppObject, name: &CStr) -> Option<T> {
     invoke_object_method(obj, name, 0, &mut []).filter(|r| !r.is_null()).map(|r| unsafe { unbox::<T>(r) })
 }
 
@@ -662,6 +677,31 @@ fn rr_event_system() -> *mut Il2CppObject {
     if exc.is_null() { es } else { null_mut() }
 }
 
+// The player's tap on a button. Locked (screen transition), under a dialog, or the dialog state
+// unknown: not pressed, the next scan retries. take claims this scan's one press.
+fn press(button: *mut Il2CppObject, what: &str, take: impl FnOnce() -> bool) -> bool {
+    if invoke_get::<bool>(button, c"IsLock") != Some(false) || DialogManager::GetForeFrontDialog() != Some(null_mut()) {
+        return false;
+    }
+    let event_system = rr_event_system();
+    if event_system.is_null() {
+        return false;
+    }
+    let event_data = il2cpp_object_new(unsafe { RR_POINTER_EVENT_DATA_CLASS });
+    if event_data.is_null() || invoke_object_method(event_data, c".ctor", 1, &mut [event_system as _]).is_none() {
+        return false;
+    }
+    if !take() {
+        return false;
+    }
+    if invoke_object_method(button, c"OnPointerClick", 1, &mut [event_data as _]).is_some() {
+        info!("superskip: pressed {}", what);
+    } else {
+        warn!("superskip: press threw ({})", what);
+    }
+    true
+}
+
 // Scan frames only (at most every 300 ms), so the name lookup is not per frame.
 fn rr_press(button: *mut Il2CppObject) {
     if button.is_null() || SceneManager::current_scene_id() != SceneId::Race
@@ -676,28 +716,8 @@ fn rr_press(button: *mut Il2CppObject) {
     if !RR_BUTTONS.iter().any(|n| name == *n) {
         return;
     }
-    // locked (screen transition), under a dialog, or the dialog state unknown: leave it, the
-    // next scan retries
-    if invoke_get::<bool>(button, c"IsLock") != Some(false) || DialogManager::GetForeFrontDialog() != Some(null_mut()) {
-        return;
-    }
-    let event_system = rr_event_system();
-    if event_system.is_null() {
-        return;
-    }
-    let event_data = il2cpp_object_new(unsafe { RR_POINTER_EVENT_DATA_CLASS });
-    if event_data.is_null() || invoke_object_method(event_data, c".ctor", 1, &mut [event_system as _]).is_none() {
-        return;
-    }
-    if !RR_SCAN.swap(false, Ordering::AcqRel) {
-        return; // one press per scan
-    }
-    let name = name.to_string(); // the click may destroy the button
-    if invoke_object_method(button, c"OnPointerClick", 1, &mut [event_data as _]).is_some() {
-        info!("superskip: race result pressed {}", name);
-    } else {
-        warn!("superskip: race result press threw ({})", name);
-    }
+    let what = format!("race result {}", name); // the click may destroy the button
+    press(button, &what, || RR_SCAN.swap(false, Ordering::AcqRel));
 }
 
 type ButtonUpdateFn = extern "C" fn(this: *mut Il2CppObject);
@@ -705,6 +725,192 @@ extern "C" fn RaceResult_ButtonUpdate(this: *mut Il2CppObject) {
     get_orig_fn!(RaceResult_ButtonUpdate, ButtonUpdateFn)(this);
     if RR_SCAN.load(Ordering::Acquire) { // false unless armed + won, in the race scene
         rr_press(this);
+    }
+    if PD_SCAN.load(Ordering::Acquire) != PD_NONE { // career paddock, scan frames only
+        pd_press(this);
+    }
+}
+
+// ---- Race results after "View Results" (career paddock) ----
+// The race isn't shown: the result pose and the result list play on the paddock screen, in the
+// career scene. Presses go through ButtonCommon::Update like the race-scene ones (only active
+// buttons update), one per 300 ms scan.
+// skip_race_result_cutin: taps the result pose once the game allows it, win or lose.
+// skip_race_result_won: presses the result list's buttons, won races only.
+
+const PD_NONE: u8 = 0;
+const PD_TAP: u8 = 1;
+const PD_NEXT: u8 = 2;
+
+struct Pd {
+    vc: usize,
+    next_scan: Instant,
+    tapped: bool, // this pose was tapped; cleared when it stops playing
+    next_done: bool, // a Next button was pressed on this list
+    list_since: Option<Instant>,
+    won: Option<bool>
+}
+
+static PD: Mutex<Option<Pd>> = Mutex::new(None);
+static PD_READY: AtomicBool = AtomicBool::new(false);
+static PD_SCAN: AtomicU8 = AtomicU8::new(PD_NONE); // what ButtonCommon::Update may press this frame
+static PD_TAPPED: AtomicBool = AtomicBool::new(false); // pd_press -> tick: the pose was tapped
+static PD_NEXTED: AtomicBool = AtomicBool::new(false); // pd_press -> tick: a Next button was pressed
+static mut PD_VIEW_CLASS: *mut Il2CppClass = null_mut(); // SingleModePaddockViewController (sealed)
+static mut PD_RACE_INFO_FIELD: *mut FieldInfo = null_mut(); // RaceResultList._raceInfo (the simulated race)
+static mut PD_RESULT_LIST_FIELD: *mut FieldInfo = null_mut(); // PaddockViewControllerBase._resultList
+static mut PD_PLAYING_FIELD: *mut FieldInfo = null_mut(); // _isPlayingCutin
+static mut PD_CAN_STOP_FIELD: *mut FieldInfo = null_mut(); // _canStopResultCutin
+static mut PD_LIST_CLICKED_FIELD: *mut FieldInfo = null_mut(); // RaceResultList._isNextButtonClicked
+// RaceResultList._screenTap, _singleModeNextButton, _nextButton
+static mut PD_LIST_BUTTON_FIELDS: [*mut FieldInfo; 3] = [null_mut(); 3];
+const PD_LIST_BUTTON_NAMES: [&str; 3] = ["ScreenTap", "SingleModeNextButton", "NextButton"];
+
+// Won: a career race (RaceType.Single) whose 1st-place horse is the player's.
+// single: the game's RaceType.Single, -1 when unresolved (never won).
+fn pd_race_won(race_type: i32, single: i32, player: i32, first: i32) -> bool {
+    single >= 0 && race_type == single && player >= 0 && first == player
+}
+
+// One scan's press. tap_ready: the pose plays, may be stopped and wasn't tapped yet.
+// list_up_for: how long the result list has been up (None: not up).
+fn pd_choose(tap_on: bool, tap_ready: bool, next_on: bool, list_up_for: Option<Duration>, next_clicked: bool, won: Option<bool>) -> u8 {
+    if tap_on && tap_ready {
+        PD_TAP
+    } else if next_on && won == Some(true) && !next_clicked && list_up_for.is_some_and(|t| t < RR_WINDOW) {
+        PD_NEXT
+    } else {
+        PD_NONE
+    }
+}
+
+// The first element of an int[], else None.
+fn first_int(obj: *mut Il2CppObject) -> Option<i32> {
+    if obj.is_null() {
+        return None;
+    }
+    let klass = unsafe { (*obj).klass() };
+    let elem = if il2cpp_class_get_rank(klass) == 1 { il2cpp_class_get_element_class(klass) } else { null_mut() };
+    if elem.is_null() || il2cpp_type_get_type(il2cpp_class_get_type(elem)) != Il2CppTypeEnum_IL2CPP_TYPE_I4 as i32 {
+        return None;
+    }
+    unsafe { Array::<i32>::from(obj as *mut Il2CppArray).as_slice() }.first().copied()
+}
+
+// None until the result list's race has been simulated, then whether it was won. Anything
+// unreadable counts as not won.
+fn pd_won(list: *mut Il2CppObject) -> Option<bool> {
+    let race = get_field_object_value::<Il2CppObject>(list, unsafe { PD_RACE_INFO_FIELD });
+    if race.is_null() || invoke_get::<bool>(race, c"get_IsDoneSimulate") != Some(true) {
+        return None;
+    }
+    let race_type = invoke_get::<i32>(race, c"get_RaceType").unwrap_or(-1);
+    let player = invoke_get::<i32>(race, c"get_PlayerHorseIndex").unwrap_or(-1);
+    let first = invoke_object_method(race, c"get_HorseIndexByFinishOrder", 0, &mut []).and_then(first_int).unwrap_or(-1);
+    let won = pd_race_won(race_type, RR_RACE_SINGLE.load(Ordering::Relaxed), player, first);
+    info!("superskip: paddock race {} (type {}, player {}, 1st {})",
+        if won { "won, advancing" } else { "not won, left to the player" }, race_type, player, first);
+    Some(won)
+}
+
+fn pd_view() -> *mut Il2CppObject {
+    let vc = SceneManager::current_view_controller();
+    if !vc.is_null() && unsafe { (*vc).klass() == PD_VIEW_CLASS } { vc } else { null_mut() }
+}
+
+fn tick_paddock() {
+    PD_SCAN.store(PD_NONE, Ordering::Release); // set again on scan frames only
+    if !PD_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let (tap_on, next_on) = {
+        let config = Hachimi::instance().config.load();
+        (config.skip_race_result_cutin, config.skip_race_result_won)
+    };
+    let vc = if (tap_on || next_on) && in_career() { pd_view() } else { null_mut() };
+    // taken every frame, so a press never carries over to another paddock
+    let tapped_now = PD_TAPPED.swap(false, Ordering::AcqRel);
+    let nexted_now = PD_NEXTED.swap(false, Ordering::AcqRel);
+    let mut pd = lock(&PD); // only taken here
+    if vc.is_null() {
+        *pd = None;
+        return;
+    }
+    let now = Instant::now();
+    let st = match pd.take() {
+        Some(st) if st.vc == vc as usize => pd.insert(st),
+        _ => pd.insert(Pd { vc: vc as usize, next_scan: now, tapped: false, next_done: false, list_since: None, won: None })
+    };
+    st.tapped |= tapped_now;
+    st.next_done |= nexted_now;
+    if now < st.next_scan {
+        return;
+    }
+    st.next_scan = now + RR_PRESS_GAP;
+
+    let playing = get_field_value::<bool>(vc, unsafe { PD_PLAYING_FIELD });
+    st.tapped &= playing;
+    let tap_ready = playing && !st.tapped && get_field_value::<bool>(vc, unsafe { PD_CAN_STOP_FIELD });
+
+    let list = if next_on && invoke_get::<bool>(vc, c"IsShowResultList") == Some(true) {
+        get_field_object_value::<Il2CppObject>(vc, unsafe { PD_RESULT_LIST_FIELD })
+    } else {
+        null_mut()
+    };
+    let mut clicked = false;
+    if !list.is_null() {
+        if st.list_since.is_none() {
+            st.list_since = Some(now);
+            info!("superskip: paddock result list up");
+        }
+        if st.won.is_none() {
+            st.won = pd_won(list);
+        }
+        // one Next press leaves the screen; a second one would land mid-transition
+        clicked = st.next_done || get_field_value::<bool>(list, unsafe { PD_LIST_CLICKED_FIELD });
+    }
+    let list_up_for = st.list_since.filter(|_| !list.is_null()).map(|t| now - t);
+    PD_SCAN.store(pd_choose(tap_on, tap_ready, next_on, list_up_for, clicked, st.won), Ordering::Release);
+}
+
+fn pressable(button: *mut Il2CppObject) -> bool {
+    !button.is_null() && invoke_get::<bool>(button, c"get_isActiveAndEnabled") == Some(true) && invoke_get::<bool>(button, c"IsLock") == Some(false)
+}
+
+fn pd_press(button: *mut Il2CppObject) {
+    let mode = PD_SCAN.load(Ordering::Acquire);
+    let vc = pd_view();
+    if button.is_null() || vc.is_null() {
+        return;
+    }
+    let what = match mode {
+        PD_TAP => {
+            let name = Object::get_name(button);
+            if name.is_null() || unsafe { (*name).as_utf16str() } != "TapButton" {
+                return;
+            }
+            "TapButton"
+        }
+        PD_NEXT => {
+            let list = get_field_object_value::<Il2CppObject>(vc, unsafe { PD_RESULT_LIST_FIELD });
+            let buttons = unsafe { PD_LIST_BUTTON_FIELDS }.map(|f| if list.is_null() { null_mut() } else { get_field_object_value::<Il2CppObject>(list, f) });
+            let Some(i) = buttons.iter().position(|&b| b == button) else { return };
+            // the screen tap only while no Next button can take the press
+            if i == 0 && buttons[1..].iter().any(|&b| pressable(b)) {
+                return;
+            }
+            PD_LIST_BUTTON_NAMES[i]
+        }
+        _ => return
+    };
+    let claim = || PD_SCAN.compare_exchange(mode, PD_NONE, Ordering::AcqRel, Ordering::Acquire).is_ok();
+    if !press(button, &format!("paddock {}", what), claim) {
+        return;
+    }
+    match what {
+        "TapButton" => PD_TAPPED.store(true, Ordering::Release),
+        "ScreenTap" => {}
+        _ => PD_NEXTED.store(true, Ordering::Release)
     }
 }
 
@@ -746,6 +952,17 @@ fn init_story(umamusume: *const Il2CppImage) {
         error!("superskip: story members missing, story skip unavailable");
         return;
     }
+    // without the Grand Live check the finale would soft-lock, so it is required too
+    let play_mode = get_field_from_name(StoryTimelineController, c"CurrentPlayMode");
+    let grand_live = find_nested_class(StoryTimelineController, c"PlayMode")
+        .map(|pm| get_field_from_name(pm, c"GrandLive")).unwrap_or(null_mut());
+    // an instance field (read off each timeline), not a static one
+    if play_mode.is_null() || grand_live.is_null() || il2cpp_field_get_flags(play_mode) & 0x10 != 0 {
+        error!("superskip: story play mode missing, story skip unavailable");
+        return;
+    }
+    unsafe { STORY_PLAY_MODE_FIELD = play_mode; }
+    STORY_PLAY_MODE_GRAND_LIVE.store(get_static_field_value::<i32>(grand_live), Ordering::Relaxed);
 
     let OnStartPlayingTimeline_addr = get_method_addr(StoryViewController, c"OnStartPlayingTimeline", 0);
     new_hook!(OnStartPlayingTimeline_addr, StoryView_OnStartPlayingTimeline);
@@ -779,45 +996,100 @@ fn init_tag(umamusume: *const Il2CppImage) {
     new_hook!(PlayCutInOut_addr, TagCutIn_PlayCutInOut);
 }
 
-// All or nothing: without any piece the window never arms and no button is hooked.
+// The press and the career race type are shared by both result skips; without them neither
+// turns on and no button is hooked. Each skip is then all or nothing on its own.
 fn init_race_result(umamusume: *const Il2CppImage) {
     get_class_or_return!(umamusume, Gallop, ButtonCommon);
-    get_class_or_return!(umamusume, Gallop, RaceMainViewController);
-    get_class_or_return!(umamusume, Gallop, SingleModeChangeViewManager);
     get_class_or_return!(umamusume, Gallop, RaceDefine);
     find_nested_class_or_return!(RaceDefine, RaceType);
-    get_class_or_return!(umamusume, Gallop, HorseRaceInfo);
     get_assembly_image_or_return!(ui_image, "UnityEngine.UI.dll");
     get_class_or_return!(ui_image, "UnityEngine.EventSystems", EventSystem);
     get_class_or_return!(ui_image, "UnityEngine.EventSystems", PointerEventData);
 
-    let result_ui_field = get_field_from_name(RaceMainViewController, c"_raceResultSceneUI");
     let current = get_method(EventSystem, c"get_current", 0).unwrap_or(std::ptr::null());
     let single = get_field_from_name(RaceType, c"Single");
-    let rank_1st = get_field_from_name(HorseRaceInfo, c"Rank1stNo");
     // without the dialog check a press could land under an open dialog
-    if result_ui_field.is_null() || current.is_null() || single.is_null() || rank_1st.is_null()
-        || !DialogManager::fore_front_dialog_available() {
+    if current.is_null() || single.is_null() || !DialogManager::fore_front_dialog_available() {
+        error!("superskip: button press members missing, race result skips unavailable");
+        return;
+    }
+    // a constant, which the runtime reads from metadata
+    RR_RACE_SINGLE.store(get_static_field_value::<i32>(single), Ordering::Relaxed);
+    unsafe {
+        RR_ES_CURRENT = current;
+        RR_POINTER_EVENT_DATA_CLASS = PointerEventData;
+    }
+
+    init_race_scene(umamusume);
+    init_paddock(umamusume);
+    if RR_READY.load(Ordering::Acquire) || PD_READY.load(Ordering::Acquire) {
+        let Update_addr = get_method_addr(ButtonCommon, c"Update", 0);
+        new_hook!(Update_addr, RaceResult_ButtonUpdate);
+    }
+}
+
+// Watched races (the race scene).
+fn init_race_scene(umamusume: *const Il2CppImage) {
+    get_class_or_return!(umamusume, Gallop, RaceMainViewController);
+    get_class_or_return!(umamusume, Gallop, SingleModeChangeViewManager);
+    get_class_or_return!(umamusume, Gallop, HorseRaceInfo);
+
+    let result_ui_field = get_field_from_name(RaceMainViewController, c"_raceResultSceneUI");
+    let rank_1st = get_field_from_name(HorseRaceInfo, c"Rank1stNo");
+    if result_ui_field.is_null() || rank_1st.is_null() {
         error!("superskip: race result members missing, race result skip unavailable");
         return;
     }
-    // both are constants, which the runtime reads from metadata
-    RR_RACE_SINGLE.store(get_static_field_value::<i32>(single), Ordering::Relaxed);
     RR_RANK_1ST.store(get_static_field_value::<i32>(rank_1st), Ordering::Relaxed);
     info!("superskip: race result ready (RaceType.Single={}, Rank1stNo={})",
         RR_RACE_SINGLE.load(Ordering::Relaxed), RR_RANK_1ST.load(Ordering::Relaxed));
     unsafe {
         RR_VIEW_CLASS = RaceMainViewController;
         RR_RESULT_UI_FIELD = result_ui_field;
-        RR_ES_CURRENT = current;
-        RR_POINTER_EVENT_DATA_CLASS = PointerEventData;
     }
     RR_READY.store(true, Ordering::Release);
 
     let ChangeMainView_addr = get_method_addr(SingleModeChangeViewManager, c"ChangeMainView", 0);
-    let Update_addr = get_method_addr(ButtonCommon, c"Update", 0);
     new_hook!(ChangeMainView_addr, RaceResult_ChangeMainView);
-    new_hook!(Update_addr, RaceResult_ButtonUpdate);
+}
+
+fn is_bool(field: *mut FieldInfo) -> bool {
+    !field.is_null() && il2cpp_type_get_type(il2cpp_field_get_type(field)) == Il2CppTypeEnum_IL2CPP_TYPE_BOOLEAN as i32
+}
+
+// "View Results" (the career paddock).
+fn init_paddock(umamusume: *const Il2CppImage) {
+    get_class_or_return!(umamusume, Gallop, PaddockViewControllerBase);
+    get_class_or_return!(umamusume, Gallop, SingleModePaddockViewController);
+    get_class_or_return!(umamusume, Gallop, RaceResultList);
+    get_class_or_return!(umamusume, Gallop, RaceInfo);
+
+    // the paddock's own _info.raceInfo is only the race's load data; the list holds the simulated race
+    let race_info = get_field_from_name(RaceResultList, c"_raceInfo");
+    let race_getters = [c"get_IsDoneSimulate", c"get_RaceType", c"get_PlayerHorseIndex", c"get_HorseIndexByFinishOrder"];
+    let result_list = get_field_from_name(PaddockViewControllerBase, c"_resultList");
+    let playing = get_field_from_name(PaddockViewControllerBase, c"_isPlayingCutin");
+    let can_stop = get_field_from_name(PaddockViewControllerBase, c"_canStopResultCutin");
+    let clicked = get_field_from_name(RaceResultList, c"_isNextButtonClicked");
+    let buttons = [c"_screenTap", c"_singleModeNextButton", c"_nextButton"].map(|n| get_field_from_name(RaceResultList, n));
+    if race_info.is_null() || result_list.is_null() || buttons.iter().any(|f| f.is_null())
+        || !is_bool(playing) || !is_bool(can_stop) || !is_bool(clicked)
+        || get_method(PaddockViewControllerBase, c"IsShowResultList", 0).is_err()
+        || race_getters.iter().any(|&m| get_method(RaceInfo, m, 0).is_err()) {
+        error!("superskip: paddock members missing, View Results skips unavailable");
+        return;
+    }
+    unsafe {
+        PD_VIEW_CLASS = SingleModePaddockViewController;
+        PD_RACE_INFO_FIELD = race_info;
+        PD_RESULT_LIST_FIELD = result_list;
+        PD_PLAYING_FIELD = playing;
+        PD_CAN_STOP_FIELD = can_stop;
+        PD_LIST_CLICKED_FIELD = clicked;
+        PD_LIST_BUTTON_FIELDS = buttons;
+    }
+    PD_READY.store(true, Ordering::Release);
+    info!("superskip: View Results skips ready");
 }
 
 pub fn init(umamusume: *const Il2CppImage) {
@@ -934,10 +1206,32 @@ mod tests {
     }
 
     #[test]
+    fn paddock_rules() {
+        assert!(pd_race_won(6, 6, 3, 3));
+        assert!(!pd_race_won(6, 6, 3, 1), "another horse 1st");
+        assert!(!pd_race_won(7, 6, 3, 3), "team race");
+        assert!(!pd_race_won(6, -1, 3, 3), "RaceType.Single unresolved");
+        assert!(!pd_race_won(6, 6, -1, -1), "unreadable player and order");
+
+        let s = Duration::from_secs;
+        // (tap_on, tap_ready, next_on, list_up_for, next_clicked, won)
+        assert_eq!(pd_choose(true, true, true, None, false, None), PD_TAP);
+        assert_eq!(pd_choose(false, true, true, None, false, None), PD_NONE, "tap toggle off");
+        assert_eq!(pd_choose(true, false, true, Some(s(1)), false, Some(true)), PD_NEXT);
+        assert_eq!(pd_choose(true, true, true, Some(s(1)), false, Some(true)), PD_TAP, "the pose first");
+        assert_eq!(pd_choose(false, false, true, Some(s(1)), false, Some(false)), PD_NONE, "loss");
+        assert_eq!(pd_choose(false, false, true, Some(s(1)), false, None), PD_NONE, "not decided");
+        assert_eq!(pd_choose(false, false, true, Some(s(1)), true, Some(true)), PD_NONE, "Next already clicked");
+        assert_eq!(pd_choose(false, false, true, None, false, Some(true)), PD_NONE, "list not up");
+        assert_eq!(pd_choose(false, false, true, Some(RR_WINDOW), false, Some(true)), PD_NONE, "window over");
+        assert_eq!(pd_choose(true, false, false, Some(s(1)), false, Some(true)), PD_NONE, "won toggle off");
+    }
+
+    #[test]
     fn old_configs_get_skip_defaults() {
         let c: crate::core::hachimi::Config = serde_json::from_str(r#"{"story_tcps_multiplier": 2.0}"#).unwrap();
         assert!(c.skip_training_cutin);
         assert!(!(c.skip_story_events || c.skip_story_everywhere || c.skip_shop_performance
-            || c.skip_rival_entry || c.skip_tag_cutin || c.skip_race_result_won));
+            || c.skip_rival_entry || c.skip_tag_cutin || c.skip_race_result_won || c.skip_race_result_cutin));
     }
 }

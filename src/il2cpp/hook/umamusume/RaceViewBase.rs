@@ -24,7 +24,8 @@ type LateUpdateViewFn = extern "C" fn(this: *mut Il2CppObject);
 extern "C" fn LateUpdateView(this: *mut Il2CppObject) {
     let first_person = free_camera::is_race_first_person();
     let head_selfie = free_camera::is_race_head_selfie();
-    if first_person || head_selfie {
+    // without GetPrefabAttachTransform (Global) these modes stay inert instead of calling address 0
+    if (first_person || head_selfie) && RaceModelController::has_prefab_attach_transform() {
         let index = free_camera::race_model_index();
         let model_controller = GetModelController(this, index);
         if !model_controller.is_null() {

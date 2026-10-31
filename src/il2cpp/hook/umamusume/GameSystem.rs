@@ -51,6 +51,7 @@ extern "C" fn GameSystem_Update(this: *mut Il2CppObject) {
     super::SceneManager::refresh_scene_id_fallback();
     super::SuperSkip::tick();
     super::CareerTimer::tick();
+    super::RaceExport::tick();
     super::SingleModeStartStepSuccessionSelect::refresh_dialog();
 
     #[cfg(target_os = "windows")]
