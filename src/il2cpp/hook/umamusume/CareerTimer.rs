@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     core::{utils, Hachimi},
-    il2cpp::{ext::Il2CppObjectExt, symbols::{invoke_object_method, unbox}}
+    il2cpp::{ext::Il2CppObjectExt, symbols::invoke_object_method}
 };
-use super::{SceneDefine::SceneId, SceneManager, WorkDataManager};
+use super::{SceneDefine::SceneId, SceneManager, SuperSkip::invoke_i32, WorkDataManager};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Saved {
@@ -49,8 +49,7 @@ fn current_turn() -> Option<i32> {
         return None;
     }
     let single_mode = invoke_object_method(wdm, c"get_SingleMode", 0, &mut []).filter(|p| !p.is_null())?;
-    let turn = invoke_object_method(single_mode, c"GetCurrentTurn", 0, &mut []).filter(|p| !p.is_null())?;
-    let turn = unsafe { unbox::<i32>(turn) };
+    let turn = invoke_i32(single_mode, c"GetCurrentTurn")?;
     (1..=200).contains(&turn).then_some(turn)
 }
 

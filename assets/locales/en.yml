@@ -300,6 +300,8 @@ config_editor:
   skip_race_result_won_desc: "After a career race you won, watched or with View Results, presses Next on the result screens for you. Never acts on losses, team races or other modes. Risky: can soft-lock, more so with event skipping on."
   force_allow_dynamic_camera: "Force allow dynamic camera"
   affinity_overlay: "Show Legacy affinity points"
+  veteran_parents_overlay: "Show veteran parents' lenders"
+  veteran_parents_overlay_desc: "On the detail screen of one of your own veterans, shows whether each parent was yours or borrowed, with the lender's Trainer ID. Must be on when the game loads your veteran list: after turning it on, return to the title screen or log in again. Shows other players' Trainer IDs on screen."
   save_race_data: "Save race data files"
   save_race_data_desc: "After each race, writes a JSON file with the race's basic details and the game's replay data to hachimi/race_data/. Stays on this PC. No player names or IDs are saved."
   save_trained_umas: "Save my trained Umas"
@@ -411,6 +413,14 @@ affinity_overlay:
   parents: "Parent 1 + 2"
   wins: "Shared G1 wins"
   total: "Total"
+
+vet_parents_overlay:
+  veteran: "Veteran no. %{id}"
+  copy: "Copy"
+  title: "Parents"
+  yours: "yours"
+  borrowed: "borrowed, Trainer ID %{id}"
+  missing: "not recorded"
 
 race_stat_hud:
   open_race_mechanics_confirm: "Do you want to open the web browser to view the Race Mechanics Document? (English only)"

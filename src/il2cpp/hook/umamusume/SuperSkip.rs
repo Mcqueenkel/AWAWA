@@ -9,15 +9,16 @@ use std::{
 };
 
 use crate::{
-    core::Hachimi,
+    core::{game::Region, Hachimi},
     il2cpp::{
         api::{
-            il2cpp_class_get_element_class, il2cpp_class_get_rank, il2cpp_class_get_type, il2cpp_class_is_subclass_of,
-            il2cpp_field_get_flags, il2cpp_field_get_type, il2cpp_object_new, il2cpp_runtime_invoke, il2cpp_type_get_type
+            il2cpp_class_enum_basetype, il2cpp_class_from_type, il2cpp_class_get_element_class, il2cpp_class_get_rank,
+            il2cpp_class_get_type, il2cpp_class_is_assignable_from, il2cpp_class_is_enum, il2cpp_class_is_subclass_of,
+            il2cpp_field_get_flags, il2cpp_field_get_type, il2cpp_field_get_value, il2cpp_object_new, il2cpp_runtime_invoke, il2cpp_type_get_type
         },
         ext::{Il2CppObjectExt, Il2CppStringExt},
         hook::UnityEngine_CoreModule::{GameObject, Object},
-        symbols::{find_nested_class, get_field_from_name, get_field_object_value, get_field_value, get_method, get_method_addr, get_method_cached, get_static_field_value, invoke_object_method, unbox, Array, GCHandle, IEnumerator, MoveNextFn},
+        symbols::{find_nested_class, get_field_from_name, get_field_object_value, get_field_value, get_method, get_method_addr, get_method_cached, get_method_overload_addr, get_static_field_value, invoke_object_method, unbox, Array, GCHandle, IEnumerator, MoveNextFn},
         types::*
     }
 };
@@ -156,7 +157,18 @@ extern "C" fn StoryView_OnStartPlayingTimeline(this: *mut Il2CppObject) {
 }
 
 static mut STORY_PLAY_MODE_FIELD: *mut FieldInfo = null_mut(); // StoryTimelineController.CurrentPlayMode
+static STORY_PLAY_MODE_STATIC: AtomicBool = AtomicBool::new(false); // a static field (JP), not per timeline
 static STORY_PLAY_MODE_GRAND_LIVE: AtomicI32 = AtomicI32::new(i32::MIN); // PlayMode.GrandLive
+
+// Zeroed first, so a short copy can't leave garbage (init checked the field is an Int32 enum).
+fn story_play_mode(timeline: *mut Il2CppObject) -> i32 {
+    if STORY_PLAY_MODE_STATIC.load(Ordering::Relaxed) {
+        return get_static_field_value::<i32>(unsafe { STORY_PLAY_MODE_FIELD });
+    }
+    let mut mode = 0i32;
+    il2cpp_field_get_value(timeline, unsafe { STORY_PLAY_MODE_FIELD }, (&mut mode as *mut i32).cast());
+    mode
+}
 
 static TICKS: AtomicU32 = AtomicU32::new(0);
 
@@ -207,12 +219,18 @@ fn tick_story() {
     }
     let Some(timeline) = invoke_object_method(view, c"get_TimelineController", 0, &mut []) else { return };
     let playing = !timeline.is_null() && invoke_get::<bool>(timeline, c"get_IsPlaying") == Some(true);
-    // A Grand Live story (the finale, shown with "All goals achieved") waits for the Live button;
-    // skipping it soft-locks the career, on any screen.
-    let grand_live = !timeline.is_null()
-        && get_field_value::<i32>(timeline, unsafe { STORY_PLAY_MODE_FIELD }) == STORY_PLAY_MODE_GRAND_LIVE.load(Ordering::Relaxed);
-    if grand_live {
-        info!("superskip: Grand Live story left alone");
+    let mode = (!timeline.is_null()).then(|| story_play_mode(timeline));
+    if Hachimi::instance().game.region == Region::Global {
+        // A Grand Live story (the finale, shown with "All goals achieved") waits for the Live button;
+        // skipping it soft-locks the career, on any screen.
+        if mode == Some(STORY_PLAY_MODE_GRAND_LIVE.load(Ordering::Relaxed)) {
+            info!("superskip: Grand Live story left alone");
+            return;
+        }
+    } else if let Some(m) = mode.filter(|&m| m != 0) {
+        // ponytail: other regions skip only PlayMode 0 (the default, normal stories); JP-only scenarios
+        // may have finale modes we don't know. Allow more modes once the log shows they are safe.
+        info!("superskip: story play mode {} left alone", m);
         return;
     }
     let training_cutt = invoke_get::<bool>(view, c"get_IsPlayingOrWillPlayTrainingCutt").unwrap_or(true);
@@ -230,7 +248,7 @@ fn tick_story() {
         Gate::Skip => {
             story().last_skip = Some(Instant::now()); // before the call, so a start it causes is debounced
             if invoke_object_method(view, c"SkipStory", 0, &mut []).is_some() {
-                info!("superskip: story SkipStory");
+                info!("superskip: story SkipStory (play mode {})", mode.unwrap_or_default());
             } else {
                 warn!("superskip: story SkipStory failed");
             }
@@ -424,14 +442,27 @@ extern "C" fn RivalEntry_MoveNext(enumerator: *mut Il2CppObject) -> bool {
     false
 }
 
-type PlayRivalEntryCoroutineFn = extern "C" fn(this: *mut Il2CppObject, end_action: *mut Il2CppObject, item_icon_list: *mut Il2CppObject) -> *mut Il2CppObject;
-extern "C" fn RivalEntry_PlayRivalEntryCoroutine(this: *mut Il2CppObject, end_action: *mut Il2CppObject, item_icon_list: *mut Il2CppObject) -> *mut Il2CppObject {
-    let enumerator = get_orig_fn!(RivalEntry_PlayRivalEntryCoroutine, PlayRivalEntryCoroutineFn)(this, end_action, item_icon_list);
+fn hook_rival_enumerator(enumerator: *mut Il2CppObject) {
     if !enumerator.is_null() && rival_enabled() {
         if let Err(e) = IEnumerator::<*mut Il2CppObject>::from(enumerator).hook_move_next(RivalEntry_MoveNext) {
             error!("superskip: rival MoveNext hook failed: {}", e);
         }
     }
+}
+
+// Global: PlayRivalEntryCoroutine(endAction, itemIconList)
+type PlayRivalEntryCoroutineFn = extern "C" fn(this: *mut Il2CppObject, end_action: *mut Il2CppObject, item_icon_list: *mut Il2CppObject) -> *mut Il2CppObject;
+extern "C" fn RivalEntry_PlayRivalEntryCoroutine(this: *mut Il2CppObject, end_action: *mut Il2CppObject, item_icon_list: *mut Il2CppObject) -> *mut Il2CppObject {
+    let enumerator = get_orig_fn!(RivalEntry_PlayRivalEntryCoroutine, PlayRivalEntryCoroutineFn)(this, end_action, item_icon_list);
+    hook_rival_enumerator(enumerator);
+    enumerator
+}
+
+// JP: PlayRivalEntryCoroutine(endAction); the skip reads the same enumerator fields, or leaves it alone
+type PlayRivalEntryCoroutine1Fn = extern "C" fn(this: *mut Il2CppObject, end_action: *mut Il2CppObject) -> *mut Il2CppObject;
+extern "C" fn RivalEntry_PlayRivalEntryCoroutine1(this: *mut Il2CppObject, end_action: *mut Il2CppObject) -> *mut Il2CppObject {
+    let enumerator = get_orig_fn!(RivalEntry_PlayRivalEntryCoroutine1, PlayRivalEntryCoroutine1Fn)(this, end_action);
+    hook_rival_enumerator(enumerator);
     enumerator
 }
 
@@ -471,8 +502,10 @@ fn tag_cutin(this: *mut Il2CppObject, callback: *mut Il2CppObject, out_part: boo
         return false;
     }
     let enabled = Hachimi::instance().config.load().skip_tag_cutin && in_career();
-    let callback_ok = invokable(callback) || (out_part && callback.is_null());
-    let action = tag_action(enabled, callback_ok, out_part, TAG_IN_SKIPPED.load(Ordering::Acquire), TAG_ROOT_HIDDEN.load(Ordering::Acquire));
+    let in_skipped = TAG_IN_SKIPPED.load(Ordering::Acquire);
+    // the callback is only looked at when a skip can happen: toggle off, nothing skipped, pure pass-through
+    let callback_ok = (enabled || in_skipped) && (invokable(callback) || (out_part && callback.is_null()));
+    let action = tag_action(enabled, callback_ok, out_part, in_skipped, TAG_ROOT_HIDDEN.load(Ordering::Acquire));
     TAG_IN_SKIPPED.store(!out_part && action == Tag::Skip, Ordering::Release);
     match action {
         Tag::Original => false,
@@ -595,6 +628,14 @@ pub(super) fn invoke_get<T: Copy>(obj: *mut Il2CppObject, name: &CStr) -> Option
     invoke_object_method(obj, name, 0, &mut []).filter(|r| !r.is_null()).map(|r| unsafe { unbox::<T>(r) })
 }
 
+// Like invoke_get::<i32>, but only a boxed System.Int32 is unboxed.
+pub(super) fn invoke_i32(obj: *mut Il2CppObject, name: &CStr) -> Option<i32> {
+    invoke_object_method(obj, name, 0, &mut []).filter(|&r| !r.is_null() && unsafe {
+        let class = (*r).klass();
+        CStr::from_ptr((*class).name) == c"Int32" && CStr::from_ptr((*class).namespaze) == c"System"
+    }).map(|r| unsafe { unbox::<i32>(r) })
+}
+
 fn rr_result_ui_up() -> bool {
     let vc = SceneManager::current_view_controller();
     !vc.is_null()
@@ -713,7 +754,8 @@ fn rr_press(button: *mut Il2CppObject) {
         return;
     }
     let name = unsafe { (*name).as_utf16str() };
-    if !RR_BUTTONS.iter().any(|n| name == *n) {
+    // the result UI again: the screen may have moved on since the scan was armed
+    if !RR_BUTTONS.iter().any(|n| name == *n) || !rr_result_ui_up() {
         return;
     }
     let what = format!("race result {}", name); // the click may destroy the button
@@ -952,17 +994,24 @@ fn init_story(umamusume: *const Il2CppImage) {
         error!("superskip: story members missing, story skip unavailable");
         return;
     }
-    // without the Grand Live check the finale would soft-lock, so it is required too
+    let global = Hachimi::instance().game.region == Region::Global;
+    // an instance field on Global, a static one on JP (the current story's mode either way)
     let play_mode = get_field_from_name(StoryTimelineController, c"CurrentPlayMode");
     let grand_live = find_nested_class(StoryTimelineController, c"PlayMode")
         .map(|pm| get_field_from_name(pm, c"GrandLive")).unwrap_or(null_mut());
-    // an instance field (read off each timeline), not a static one
-    if play_mode.is_null() || grand_live.is_null() || il2cpp_field_get_flags(play_mode) & 0x10 != 0 {
+    // Global: without the Grand Live check the finale soft-locks, so it is required. Elsewhere only
+    // PlayMode 0 is ever skipped, so a Grand Live story is left alone without it.
+    if play_mode.is_null() || (global && grand_live.is_null()) || !is_int_enum(play_mode) {
         error!("superskip: story play mode missing, story skip unavailable");
         return;
     }
+    let is_static = il2cpp_field_get_flags(play_mode) & 0x10 != 0;
+    STORY_PLAY_MODE_STATIC.store(is_static, Ordering::Relaxed);
+    info!("superskip: story play mode ready ({})", if is_static { "static" } else { "per timeline" });
     unsafe { STORY_PLAY_MODE_FIELD = play_mode; }
-    STORY_PLAY_MODE_GRAND_LIVE.store(get_static_field_value::<i32>(grand_live), Ordering::Relaxed);
+    if !grand_live.is_null() {
+        STORY_PLAY_MODE_GRAND_LIVE.store(get_static_field_value::<i32>(grand_live), Ordering::Relaxed);
+    }
 
     let OnStartPlayingTimeline_addr = get_method_addr(StoryViewController, c"OnStartPlayingTimeline", 0);
     new_hook!(OnStartPlayingTimeline_addr, StoryView_OnStartPlayingTimeline);
@@ -981,16 +1030,44 @@ fn init_rival(umamusume: *const Il2CppImage) {
     get_class_or_return!(umamusume, Gallop, PaddockViewControllerBase);
     unsafe { PADDOCK_CLASS = PaddockViewControllerBase; }
 
-    let PlayRivalEntryCoroutine_addr = get_method_addr(PartsRivalEntryAnimation, c"PlayRivalEntryCoroutine", 2);
-    new_hook!(PlayRivalEntryCoroutine_addr, RivalEntry_PlayRivalEntryCoroutine);
+    if Hachimi::instance().game.region == Region::Global {
+        let PlayRivalEntryCoroutine_addr = get_method_addr(PartsRivalEntryAnimation, c"PlayRivalEntryCoroutine", 2);
+        new_hook!(PlayRivalEntryCoroutine_addr, RivalEntry_PlayRivalEntryCoroutine);
+    } else {
+        // by parameter type: one reference (an Action), so the forwarded argument is always a pointer
+        let PlayRivalEntryCoroutine1_addr = get_method_overload_addr(PartsRivalEntryAnimation, "PlayRivalEntryCoroutine",
+            &[Il2CppTypeEnum_IL2CPP_TYPE_CLASS]);
+        new_hook!(PlayRivalEntryCoroutine1_addr, RivalEntry_PlayRivalEntryCoroutine1);
+    }
 }
 
 fn init_tag(umamusume: *const Il2CppImage) {
     get_class_or_return!(umamusume, Gallop, SingleModeMainViewTagTrainingCutInPlayer);
-    unsafe { TAG_ROOT_FIELD = get_field_from_name(SingleModeMainViewTagTrainingCutInPlayer, c"_tagCutInRootObject"); }
+    // a skip deactivates this root, so it must be a GameObject
+    let root = get_field_from_name(SingleModeMainViewTagTrainingCutInPlayer, c"_tagCutInRootObject");
+    let root_class = if root.is_null() { null_mut() } else { il2cpp_class_from_type(il2cpp_field_get_type(root)) };
+    if root_class.is_null() || GameObject::class().is_null() || !il2cpp_class_is_assignable_from(GameObject::class(), root_class) {
+        warn!("superskip: tag cut-in root is not a GameObject, tag cut-in skip unavailable");
+        return;
+    }
+    unsafe { TAG_ROOT_FIELD = root; }
 
-    let PlayCutIn_addr = get_method_addr(SingleModeMainViewTagTrainingCutInPlayer, c"PlayCutIn", 2);
-    let PlayCutInOut_addr = get_method_addr(SingleModeMainViewTagTrainingCutInPlayer, c"PlayCutInOut", 1);
+    // Global: the by-argc lookup confirmed in game. Elsewhere by parameter type,
+    // PlayCutIn(List<T> partnerList, Action onInEnd) and PlayCutInOut(Action onEnd), so another overload is never hooked.
+    let (PlayCutIn_addr, PlayCutInOut_addr) = if Hachimi::instance().game.region == Region::Global {
+        (get_method_addr(SingleModeMainViewTagTrainingCutInPlayer, c"PlayCutIn", 2),
+         get_method_addr(SingleModeMainViewTagTrainingCutInPlayer, c"PlayCutInOut", 1))
+    } else {
+        (get_method_overload_addr(SingleModeMainViewTagTrainingCutInPlayer, "PlayCutIn",
+            &[Il2CppTypeEnum_IL2CPP_TYPE_GENERICINST, Il2CppTypeEnum_IL2CPP_TYPE_CLASS]),
+         get_method_overload_addr(SingleModeMainViewTagTrainingCutInPlayer, "PlayCutInOut",
+            &[Il2CppTypeEnum_IL2CPP_TYPE_CLASS]))
+    };
+    // a skipped in part needs its out part hooked too, so both or neither
+    if PlayCutIn_addr == 0 || PlayCutInOut_addr == 0 {
+        warn!("superskip: tag cut-in methods missing, tag cut-in skip unavailable");
+        return;
+    }
 
     new_hook!(PlayCutIn_addr, TagCutIn_PlayCutIn);
     new_hook!(PlayCutInOut_addr, TagCutIn_PlayCutInOut);
@@ -1055,6 +1132,16 @@ fn init_race_scene(umamusume: *const Il2CppImage) {
 
 fn is_bool(field: *mut FieldInfo) -> bool {
     !field.is_null() && il2cpp_type_get_type(il2cpp_field_get_type(field)) == Il2CppTypeEnum_IL2CPP_TYPE_BOOLEAN as i32
+}
+
+// An enum backed by Int32: exactly the 4 bytes an i32 read expects.
+fn is_int_enum(field: *mut FieldInfo) -> bool {
+    let class = il2cpp_class_from_type(il2cpp_field_get_type(field));
+    if class.is_null() || !il2cpp_class_is_enum(class) {
+        return false;
+    }
+    let base = il2cpp_class_enum_basetype(class);
+    !base.is_null() && il2cpp_type_get_type(base) == Il2CppTypeEnum_IL2CPP_TYPE_I4 as i32
 }
 
 // "View Results" (the career paddock).

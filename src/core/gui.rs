@@ -409,7 +409,8 @@ const RACE_STAT_HUD_FEED_CAP: usize = 50;
 fn windows_split_game_view(screen: egui::Rect, ppp: f32) -> Option<(egui::Rect, &'static str)> {
     use crate::il2cpp::hook::umamusume::{LandscapeUIManager, Screen as GallopScreen};
 
-    if !GallopScreen::get_IsSplitWindow() {
+    // guarded getters: a missing one means no split rect, or the constants
+    if !GallopScreen::is_split_window() {
         return None;
     }
 
@@ -420,17 +421,16 @@ fn windows_split_game_view(screen: egui::Rect, ppp: f32) -> Option<(egui::Rect, 
 
     if let Some((x, y, w, h)) = LandscapeUIManager::game_screen_info() {
         let physical = (h - window.y).abs() <= window.y * 0.02;
-        let rate = LandscapeUIManager::get_WindowScaleRate();
-        let (r, src) = if physical {
-            (egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), "gamescreeninfo")
+        let scaled = if physical {
+            Some((egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)), "gamescreeninfo"))
         } else {
-            (
+            LandscapeUIManager::window_scale_rate().map(|rate| (
                 egui::Rect::from_min_size(egui::pos2(x * rate, y * rate), egui::vec2(w * rate, h * rate)),
                 "gamescreeninfo+rate",
-            )
+            ))
         };
 
-        if split_rect_sane(r, window) {
+        if let Some((r, src)) = scaled.filter(|(r, _)| split_rect_sane(*r, window)) {
             rect_px = r;
             source = src;
         }
@@ -3727,6 +3727,31 @@ impl Gui {
         }
     }
 
+    // Read-only and click-through: not interactable, and never counted as GUI input.
+    fn run_vet_parents_overlay(ctx: &egui::Context) {
+        let Some((id, lines)) = crate::il2cpp::hook::umamusume::DialogTrainedCharacterDetail::overlay() else { return };
+        let scale = get_scale(ctx);
+        // clickable for the Copy button; only the box's own rect takes clicks from the game
+        egui::Area::new(egui::Id::new("vet_parents_overlay"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0 * scale, 96.0 * scale))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.horizontal(|ui| {
+                        ui.strong(t!("vet_parents_overlay.veteran", id = id));
+                        if ui.small_button(t!("vet_parents_overlay.copy")).clicked()
+                            && !crate::core::utils::set_clipboard_text(&id.to_string()) {
+                            warn!("vet parents: copy to clipboard failed");
+                        }
+                    });
+                    ui.strong(t!("vet_parents_overlay.title"));
+                    for line in lines {
+                        ui.label(line);
+                    }
+                });
+            });
+    }
+
     pub fn run(&mut self) -> egui::FullOutput {
         if let Ok(mut lock) = PENDING_THEME.lock() {
             if let Some(config) = lock.take() {
@@ -3876,12 +3901,15 @@ impl Gui {
         #[cfg(target_os = "windows")]
         Self::run_race_name_markers(&ctx);
         Self::run_affinity_overlay(&ctx);
+        Self::run_vet_parents_overlay(&ctx);
 
         let has_interactive_widgets = IS_LIVE_SCENE.load(atomic::Ordering::Relaxed);
         let race_slider_input = Self::race_slider_showing();
         let race_playback_button_input = Self::race_playback_button_showing();
         let race_stat_hud_input = RaceStatHud::is_active();
-        let affinity_input = Self::affinity_overlay().is_some();
+        // the veteran box's Copy button needs clicks too; outside both boxes they still reach the game
+        let affinity_input = Self::affinity_overlay().is_some()
+            || crate::il2cpp::hook::umamusume::DialogTrainedCharacterDetail::showing();
         #[cfg(target_os = "windows")]
         let free_camera_input_capture = free_camera::wants_windows_input_capture();
 
@@ -4710,7 +4738,13 @@ impl Gui {
         let Some(markers) = crate::il2cpp::hook::umamusume::RaceCameraManager::name_markers() else {
             return;
         };
-        let rect = RaceStatHud::game_view(ctx, ctx.viewport_rect()).0;
+        let screen = ctx.viewport_rect();
+        let rect = if Hachimi::instance().game.region == Region::Japan {
+            // JP's landscape UI may split the window: tags follow the game view, else the full window
+            windows_split_game_view(screen, ctx.pixels_per_point()).map_or(screen, |(r, _)| r)
+        } else {
+            RaceStatHud::game_view(ctx, screen).0
+        };
         let scale = get_scale(ctx);
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("race_name_markers")));
         let font = egui::FontId::proportional(12.0 * scale);
@@ -4742,6 +4776,7 @@ impl Gui {
             !crate::il2cpp::hook::umamusume::RaceCameraManager::has_name_markers() &&
             !RaceStatHud::elements_showing() && !RaceStatHud::is_active() &&
             Self::affinity_overlay().is_none() &&
+            !crate::il2cpp::hook::umamusume::DialogTrainedCharacterDetail::showing() &&
             !IS_CONSUMING_INPUT.load(atomic::Ordering::Acquire) &&
             !GUI_INPUT_ACTIVE.load(atomic::Ordering::Acquire)
         }
@@ -4754,6 +4789,7 @@ impl Gui {
             !Self::race_playback_button_showing() &&
             !RaceStatHud::elements_showing() && !RaceStatHud::is_active() &&
             Self::affinity_overlay().is_none() &&
+            !crate::il2cpp::hook::umamusume::DialogTrainedCharacterDetail::showing() &&
             !IS_CONSUMING_INPUT.load(atomic::Ordering::Acquire)
         }
     }
@@ -6423,6 +6459,16 @@ impl ConfigEditor {
             if should_show_option(search, &t!("config_editor.affinity_overlay")) {
                 ui.label(t!("config_editor.affinity_overlay"));
                 ui.checkbox(&mut config.affinity_overlay, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.veteran_parents_overlay")) {
+                ui.label(t!("config_editor.veteran_parents_overlay")).on_hover_text(t!("config_editor.veteran_parents_overlay_desc"));
+                ui.checkbox(&mut config.veteran_parents_overlay, "");
+                ui.end_row();
+                // inline too, as the risky auto-skip rows: touch screens get no hover text
+                ui.label("");
+                ui.label(egui::RichText::new(t!("config_editor.veteran_parents_overlay_desc")).small());
                 ui.end_row();
             }
 

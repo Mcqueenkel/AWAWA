@@ -957,6 +957,8 @@ pub struct Config {
     pub save_race_data: bool, // il2cpp/hook/umamusume/RaceExport.rs
     #[serde(default)]
     pub save_trained_umas: bool, // il2cpp/hook/umamusume/WorkTrainedCharaData.rs
+    #[serde(default)]
+    pub veteran_parents_overlay: bool, // il2cpp/hook/umamusume/DialogTrainedCharacterDetail.rs
     #[serde(flatten)]
     pub caption: CaptionConfig,
     #[serde(default)]

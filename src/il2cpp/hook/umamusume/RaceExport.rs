@@ -7,15 +7,15 @@ use chrono::{Local, NaiveDateTime};
 use serde::Serialize;
 
 use crate::{
-    core::{utils, Hachimi},
+    core::{game::Region, utils, Hachimi},
     il2cpp::{
         api::{il2cpp_field_get_flags, il2cpp_field_get_name},
         ext::Il2CppStringExt,
-        symbols::{find_nested_class, get_class, get_method_addr, get_static_field_value, invoke_object_method, Array, FieldsIter, GCHandle},
+        symbols::{find_nested_class, get_class, get_method_overload_addr, get_static_field_value, invoke_object_method, FieldsIter, GCHandle},
         types::*
     }
 };
-use super::SuperSkip::{invoke_get, lock};
+use super::{SuperSkip::{invoke_get, lock}, WorkTrainedCharaData::elems};
 
 // Enums are the game's raw values. Anything unreadable is null.
 #[derive(Serialize)]
@@ -53,15 +53,16 @@ fn record(race: *mut Il2CppObject, blob: *mut Il2CppString, exported_at: String)
         race_type: get(c"get_RaceType"),
         race_instance_id: get(c"get_RaceInstanceId"),
         track_id: get(c"get_RaceTrackId"),
-        distance: get(c"get_CourseDistance"),
+        // upstream only calls get_CourseDistance on Global
+        distance: get(if Hachimi::instance().game.region == Region::Global { c"get_CourseDistance" } else { c"get_CourseOnlyDistance" }),
         grade: get(c"get_Grade"),
         ground_condition: get(c"get_GroundCondition"),
         weather: get(c"get_Weather"),
         player_horse_index: get(c"get_PlayerHorseIndex").filter(|&i| i >= 0),
-        // null until the game has cached the order
+        // null until the game has cached the order, or when the result isn't an int[]
         finish_order: invoke_object_method(race, c"get_HorseIndexByFinishOrder", 0, &mut [])
-            .filter(|p| !p.is_null())
-            .map(|p| unsafe { Array::<i32>::from(p as *mut Il2CppArray).as_slice() }.to_vec()),
+            .map(|p| elems::<i32>(p, Il2CppTypeEnum_IL2CPP_TYPE_I4))
+            .filter(|v| !v.is_empty()),
         sim_data_base64: unsafe { (*blob).as_utf16str() }.to_string()
     }
 }
@@ -122,7 +123,7 @@ extern "C" fn RaceInfo_SetAndDeserializeBase64(this: *mut Il2CppObject, sim_data
 
 pub fn init(umamusume: *const Il2CppImage) {
     get_class_or_return!(umamusume, Gallop, RaceInfo);
-    let SetAndDeserializeBase64_addr = get_method_addr(RaceInfo, c"SetAndDeserializeBase64", 1);
+    let SetAndDeserializeBase64_addr = get_method_overload_addr(RaceInfo, "SetAndDeserializeBase64", &[Il2CppTypeEnum_IL2CPP_TYPE_STRING]);
     new_hook!(SetAndDeserializeBase64_addr, RaceInfo_SetAndDeserializeBase64);
 
     // RaceType names for the file names; without them the number is used

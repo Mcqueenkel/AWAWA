@@ -1,4 +1,4 @@
-use crate::il2cpp::{api::il2cpp_resolve_icall, symbols::get_method_addr, types::*};
+use crate::il2cpp::{api::{il2cpp_class_is_assignable_from, il2cpp_resolve_icall}, ext::Il2CppObjectExt, symbols::get_method_addr, types::*};
 
 #[cfg(target_os = "windows")]
 use crate::windows::free_camera::{self, CameraScene};
@@ -12,10 +12,15 @@ impl_addr_wrapper_fn!(set_fieldOfView, SET_FIELD_OF_VIEW_ADDR, (), this: *mut Il
 
 static mut WORLD_TO_VIEWPORT_POINT_ADDR: usize = 0;
 impl_addr_wrapper_fn!(WorldToViewportPoint, WORLD_TO_VIEWPORT_POINT_ADDR, Vector3_t, this: *mut Il2CppObject, position: Vector3_t);
+static mut CLASS: *mut Il2CppClass = 0 as _;
 
-// Viewport point (0..1, origin bottom-left, z = depth), or None when the method is missing.
+// Viewport point (0..1, origin bottom-left, z = depth), or None when the method is missing
+// or cam is not a UnityEngine.Camera.
 pub fn world_to_viewport(cam: *mut Il2CppObject, position: Vector3_t) -> Option<Vector3_t> {
-    (unsafe { WORLD_TO_VIEWPORT_POINT_ADDR } != 0).then(|| WorldToViewportPoint(cam, position))
+    let class = unsafe { CLASS };
+    (unsafe { WORLD_TO_VIEWPORT_POINT_ADDR } != 0 && !cam.is_null() && !class.is_null()
+        && il2cpp_class_is_assignable_from(class, unsafe { (*cam).klass() }))
+        .then(|| WorldToViewportPoint(cam, position))
 }
 
 #[cfg(target_os = "windows")]
@@ -92,5 +97,6 @@ pub fn init(UnityEngine_CoreModule: *const Il2CppImage) {
     get_class_or_return!(UnityEngine_CoreModule, UnityEngine, Camera);
     unsafe {
         WORLD_TO_VIEWPORT_POINT_ADDR = get_method_addr(Camera, c"WorldToViewportPoint", 1);
+        CLASS = Camera;
     }
 }

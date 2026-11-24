@@ -333,6 +333,12 @@ static mut GET_ISSPLITWINDOW_ADDR: usize = 0;
 #[cfg(target_os = "windows")]
 impl_addr_wrapper_fn!(get_IsSplitWindow, GET_ISSPLITWINDOW_ADDR, bool,);
 
+// false when the getter is missing
+#[cfg(target_os = "windows")]
+pub fn is_split_window() -> bool {
+    (unsafe { GET_ISSPLITWINDOW_ADDR } != 0) && get_IsSplitWindow()
+}
+
 #[cfg(target_os = "windows")]
 static mut GET_ISLANDSCAPE_MODE_ADDR: usize = 0;
 #[cfg(target_os = "windows")]

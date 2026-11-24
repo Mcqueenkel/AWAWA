@@ -1221,6 +1221,28 @@ pub fn get_g1_saddle_ids() -> Vec<i32> {
     get_single_column_int("SELECT id FROM single_mode_wins_saddle WHERE win_saddle_type = 3")
 }
 
+/// JP: G1 relation groups (one race under several saddle ids) that saddles in `a` share with `b`.
+/// None when the relation_group_id column is missing or the query returns nothing.
+pub fn get_shared_g1_groups(a: &[i32], b: &[i32]) -> Option<i32> {
+    // the column is checked first, so a query on a missing column is never run
+    static HAS_GROUPS: Lazy<bool> = Lazy::new(|| {
+        let has = get_single_column_int("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'single_mode_wins_saddle' AND sql LIKE '%relation_group_id%'").first() == Some(&1);
+        info!("affinity: relation_group_id {}", if has { "found" } else { "missing, exact saddle ids used" });
+        has
+    });
+    if !*HAS_GROUPS {
+        return None;
+    }
+    if a.is_empty() || b.is_empty() {
+        return Some(0);
+    }
+    let list = |ids: &[i32]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+    get_single_column_int(&format!(
+        "SELECT COUNT(DISTINCT x.relation_group_id) FROM single_mode_wins_saddle x JOIN single_mode_wins_saddle y ON x.relation_group_id = y.relation_group_id WHERE x.win_saddle_type = 3 AND x.id IN ({}) AND y.id IN ({})",
+        list(a), list(b)
+    )).first().copied()
+}
+
 pub fn get_all_cards() -> Vec<(i32, i32)> {
     let mut items = Vec::new();
     let db_path = get_masterdb_path();

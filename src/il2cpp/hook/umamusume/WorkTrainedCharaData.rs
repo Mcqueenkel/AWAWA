@@ -2,7 +2,8 @@
 // game loads or updates its veteran list. Read-only, local file only. Everything comes from the plain server
 // models (Gallop.TrainedChara) the game hands to WorkTrainedCharaData; its work copies keep sparks, create
 // time and chara id as Obscured*, which are never read here.
-use std::{collections::BTreeMap, ffi::CStr, ptr::null_mut, sync::{atomic::{AtomicBool, Ordering}, Mutex}};
+// The same hooks also keep each own veteran's two parents in memory for the veteran parents overlay.
+use std::{collections::BTreeMap, ffi::CStr, ptr::null_mut, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Mutex}};
 
 use serde_json::{json, Value};
 
@@ -11,11 +12,11 @@ use crate::{
     il2cpp::{
         api::{il2cpp_class_get_element_class, il2cpp_class_get_field_from_name, il2cpp_class_get_rank, il2cpp_class_get_type, il2cpp_field_get_type, il2cpp_type_get_type},
         ext::{Il2CppObjectExt, Il2CppStringExt},
-        symbols::{get_field_object_value, get_field_value, get_method_addr, invoke_object_method, Array},
+        symbols::{get_field_object_value, get_field_value, get_method_overload_addr, invoke_object_method, Array},
         types::*
     }
 };
-use super::{SuperSkip::lock, WorkDataManager};
+use super::{DialogTrainedCharacterDetail::parent_slot, SuperSkip::lock, WorkDataManager};
 
 // JSON key -> public Int32 field of Gallop.TrainedChara
 const STATS: [(&str, &CStr); 5] = [("speed", c"speed"), ("stamina", c"stamina"), ("power", c"power"), ("guts", c"guts"), ("wit", c"wiz")];
@@ -32,6 +33,28 @@ static STORE: Mutex<Store> = Mutex::new(Store { viewer: None, umas: BTreeMap::ne
 static BUSY: AtomicBool = AtomicBool::new(false);
 static PENDING: AtomicBool = AtomicBool::new(false); // a writer is spawned and hasn't taken its snapshot yet
 static WRITE: Mutex<()> = Mutex::new(());
+
+// An own veteran's parents: (card_id, owner_viewer_id) for parent 1 and 2. Memory only, never logged or written.
+#[derive(Clone, Copy)]
+pub(super) struct Vet { pub viewer: i64, pub card_id: i32, pub parents: [Option<(i32, i64)>; 2] }
+static PARENTS: Mutex<BTreeMap<i32, Vet>> = Mutex::new(BTreeMap::new()); // by trained_chara_id
+static GEN: AtomicU32 = AtomicU32::new(0); // bumped by every capture, so an open dialog rebuilds
+
+pub(super) fn vet(id: i32) -> Option<Vet> {
+    lock(&PARENTS).get(&id).copied()
+}
+
+pub(super) fn generation() -> u32 {
+    GEN.load(Ordering::Acquire)
+}
+
+// UpdateAll replaces the map, Add/Update upsert. An empty list never wipes it (as with the export file).
+fn apply(map: &mut BTreeMap<i32, Vet>, vets: Vec<(i32, Vet)>, replace: bool) {
+    if replace && !vets.is_empty() {
+        map.clear();
+    }
+    map.extend(vets);
+}
 
 // A field of exactly this type, else None: an Obscured struct (VALUETYPE) is never read as a number.
 // ponytail: looked up per read (~150 per Uma); cache per class if UpdateAll ever hitches
@@ -58,7 +81,7 @@ fn array(obj: *mut Il2CppObject, name: &CStr) -> *mut Il2CppObject {
 }
 
 // A rank-1 array whose element type is `ty` (I4 for i32, CLASS for objects), else empty.
-fn elems<T: Copy>(arr: *mut Il2CppObject, ty: Il2CppTypeEnum) -> Vec<T> {
+pub(super) fn elems<T: Copy>(arr: *mut Il2CppObject, ty: Il2CppTypeEnum) -> Vec<T> {
     if arr.is_null() {
         return Vec::new();
     }
@@ -95,7 +118,7 @@ fn record(tc: *mut Il2CppObject, id: i32) -> Value {
         "aptitudes": ints(tc, &APTITUDES),
         "skills": levels(tc, c"skill_array", c"skill_id"),
         "sparks": levels(tc, c"factor_info_array", c"factor_id"),
-        // owner_viewer_id / user_info_summary name another trainer for a borrowed parent: never read
+        // a parent's owner_viewer_id is read only by capture() for the overlay, never exported; user_info_summary is never read
         "parents": objs(array(tc, c"succession_chara_array")).into_iter().map(|p| json!({
             "position": int(p, c"position_id"),
             "card_id": int(p, c"card_id"),
@@ -138,13 +161,42 @@ fn is_game_list(this: *mut Il2CppObject) -> bool {
     !wdm.is_null() && invoke_object_method(wdm, c"get_TrainedCharaData", 0, &mut []) == Some(this)
 }
 
-fn enabled() -> bool {
-    Hachimi::instance().config.load().save_trained_umas
+// Own veterans only (same rule as the export).
+fn capture(items: &[*mut Il2CppObject], replace: bool) {
+    let vets: Vec<_> = items.iter().filter_map(|&tc| {
+        let use_type = int(tc, c"use_type").filter(|&u| u == 0)?;
+        let (id, viewer, card_id) = (int(tc, c"trained_chara_id")?, long(tc, c"viewer_id")?, int(tc, c"card_id")?);
+        if !is_own(use_type, long(tc, c"owner_viewer_id")?, viewer) {
+            return None;
+        }
+        let mut parents = [None; 2];
+        for p in objs(array(tc, c"succession_chara_array")) {
+            // position first: a grandparent's card and owner are never read
+            let Some(slot) = int(p, c"position_id").and_then(parent_slot) else { continue };
+            if let (Some(card), Some(owner)) = (int(p, c"card_id"), long(p, c"owner_viewer_id")) {
+                parents[slot] = Some((card, owner));
+            }
+        }
+        Some((id, Vet { viewer, card_id, parents }))
+    }).collect();
+    let mut map = lock(&PARENTS);
+    apply(&mut map, vets, replace);
+    GEN.fetch_add(1, Ordering::AcqRel);
+    if replace {
+        info!("vet parents: {} veterans captured", map.len());
+    }
 }
 
 // Main thread, inside the hook: the TrainedChara objects are read before the response is dropped.
 fn export(this: *mut Il2CppObject, items: Vec<*mut Il2CppObject>, replace: bool) {
     if !is_game_list(this) {
+        return;
+    }
+    let config = Hachimi::instance().config.load();
+    if config.veteran_parents_overlay {
+        capture(&items, replace);
+    }
+    if !config.save_trained_umas {
         return;
     }
     let rows: Vec<_> = items.into_iter().filter_map(|tc| {
@@ -179,8 +231,10 @@ fn write() {
 }
 
 // The game may call Update from inside UpdateAll / AddTrainedCharaArray: only the outermost call exports.
-// While the setting is off the base list is forgotten, so after turning it back on deltas wait for a fresh
-// UpdateAll instead of landing on a list that missed changes.
+// While the export is off its base list is forgotten, so after turning it back on deltas wait for a fresh
+// UpdateAll instead of landing on a list that missed changes. Likewise the parents map is emptied while the
+// overlay is off (no lender ids or another account's veterans kept); a veteran it misses gets no overlay.
+// ponytail: emptied on the next list call after the overlay goes off, not at the toggle itself
 fn outermost_enabled(orig: impl FnOnce()) -> bool {
     let outer = !BUSY.swap(true, Ordering::AcqRel);
     orig();
@@ -188,11 +242,14 @@ fn outermost_enabled(orig: impl FnOnce()) -> bool {
         return false;
     }
     BUSY.store(false, Ordering::Release);
-    if !enabled() {
+    let config = Hachimi::instance().config.load();
+    if !config.save_trained_umas {
         lock(&STORE).viewer = None;
-        return false;
     }
-    true
+    if !config.veteran_parents_overlay {
+        lock(&PARENTS).clear();
+    }
+    config.save_trained_umas || config.veteran_parents_overlay
 }
 
 type ArrayFn = extern "C" fn(this: *mut Il2CppObject, arr: *mut Il2CppObject);
@@ -217,9 +274,10 @@ extern "C" fn WorkTrainedCharaData_Update(this: *mut Il2CppObject, chara: *mut I
 
 pub fn init(umamusume: *const Il2CppImage) {
     get_class_or_return!(umamusume, Gallop, WorkTrainedCharaData);
-    let UpdateAll_addr = get_method_addr(WorkTrainedCharaData, c"UpdateAll", 1);
-    let AddTrainedCharaArray_addr = get_method_addr(WorkTrainedCharaData, c"AddTrainedCharaArray", 1);
-    let Update_addr = get_method_addr(WorkTrainedCharaData, c"Update", 1);
+    // by parameter type: another overload with one argument is never hooked
+    let UpdateAll_addr = get_method_overload_addr(WorkTrainedCharaData, "UpdateAll", &[Il2CppTypeEnum_IL2CPP_TYPE_SZARRAY]);
+    let AddTrainedCharaArray_addr = get_method_overload_addr(WorkTrainedCharaData, "AddTrainedCharaArray", &[Il2CppTypeEnum_IL2CPP_TYPE_SZARRAY]);
+    let Update_addr = get_method_overload_addr(WorkTrainedCharaData, "Update", &[Il2CppTypeEnum_IL2CPP_TYPE_CLASS]);
     new_hook!(UpdateAll_addr, WorkTrainedCharaData_UpdateAll);
     new_hook!(AddTrainedCharaArray_addr, WorkTrainedCharaData_AddTrainedCharaArray);
     new_hook!(Update_addr, WorkTrainedCharaData_Update);
@@ -247,6 +305,17 @@ mod tests {
         assert_eq!((st.viewer, st.umas.len()), (Some(7), 1), "another account's delta is ignored");
         assert!(merge(&mut st, vec![row(8, 5)], true));
         assert_eq!((st.viewer, st.umas.len()), (Some(8), 1));
+
+        let vet = |card_id| Vet { viewer: 7, card_id, parents: [None; 2] };
+        let cards = |m: &BTreeMap<i32, Vet>| m.iter().map(|(&k, v)| (k, v.card_id)).collect::<Vec<_>>();
+        let mut map = BTreeMap::new();
+        apply(&mut map, vec![(1, vet(10)), (2, vet(20))], true);
+        apply(&mut map, vec![(2, vet(21)), (3, vet(30))], false);
+        assert_eq!(cards(&map), [(1, 10), (2, 21), (3, 30)], "Add/Update upsert");
+        apply(&mut map, vec![], true);
+        assert_eq!(map.len(), 3, "an empty UpdateAll never wipes the parents");
+        apply(&mut map, vec![(4, vet(40))], true);
+        assert_eq!(cards(&map), [(4, 40)], "UpdateAll replaces the parents");
 
         assert_eq!(file_name(Some(8)), "trained_umas_8.json");
         assert_eq!(file_name(None), "trained_umas.json");

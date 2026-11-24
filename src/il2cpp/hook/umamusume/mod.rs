@@ -199,6 +199,7 @@ mod CareerTimer;
 mod RaceExport;
 mod WorkTrainedCharaData;
 pub mod SingleModeStartStepSuccessionSelect;
+pub mod DialogTrainedCharacterDetail;
 
 pub fn init() {
     get_assembly_image_or_return!(image, "umamusume.dll");
@@ -366,4 +367,5 @@ pub fn init() {
     SuperSkip::init(image);
     RaceExport::init(image);
     SingleModeStartStepSuccessionSelect::init(image);
+    DialogTrainedCharacterDetail::init(image);
 }

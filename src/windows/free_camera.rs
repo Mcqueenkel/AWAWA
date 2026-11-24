@@ -1682,8 +1682,10 @@ pub fn on_windows_key(vk: u16, pressed: bool, repeat: bool) {
     set_key_flag(&mut state.key_state, vk, pressed, kb);
     // STATE is held: use state.scene, never scene()
     let race_extras = config.windows.free_camera.race_extras && state.scene == CameraScene::Race;
-    if vk == kb.orbit_left { state.key_state.orbit_left = pressed && race_extras; }
-    if vk == kb.orbit_right { state.key_state.orbit_right = pressed && race_extras; }
+    // head selfie ignores race_orbit_yaw (update_race_head_follow), so orbit stays off there
+    let orbit = race_extras && !config.windows.free_camera.selfie_use_head_transform;
+    if vk == kb.orbit_left { state.key_state.orbit_left = pressed && orbit; }
+    if vk == kb.orbit_right { state.key_state.orbit_right = pressed && orbit; }
 
     if !pressed || repeat {
         return;
@@ -1941,7 +1943,7 @@ fn apply_input_locked(
     if state.key_state.follow_offset_right {
         adjust_follow_offset_x_locked(state, -move_step * 10.0);
     }
-    if config.race_extras && state.scene == CameraScene::Race && state.mode == FreeCameraMode::SelfieStick {
+    if config.race_extras && !config.selfie_use_head_transform && state.scene == CameraScene::Race && state.mode == FreeCameraMode::SelfieStick {
         let orbit = bool_axis(state.key_state.orbit_left, state.key_state.orbit_right);
         state.race_orbit_yaw = (state.race_orbit_yaw + orbit * look_step).rem_euclid(360.0);
     }

@@ -53,6 +53,7 @@ extern "C" fn GameSystem_Update(this: *mut Il2CppObject) {
     super::CareerTimer::tick();
     super::RaceExport::tick();
     super::SingleModeStartStepSuccessionSelect::refresh_dialog();
+    super::DialogTrainedCharacterDetail::tick();
 
     #[cfg(target_os = "windows")]
     {

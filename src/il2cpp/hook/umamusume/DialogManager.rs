@@ -1,5 +1,5 @@
 use std::ptr::null_mut;
-use crate::{il2cpp::{api::il2cpp_runtime_invoke, ext::StringExt, symbols::{get_method, get_method_addr, SingletonLike}, types::*}};
+use crate::{il2cpp::{api::{il2cpp_method_get_flags, il2cpp_runtime_invoke}, ext::StringExt, symbols::{get_method, get_method_addr, SingletonLike}, types::*}};
 use super::{DialogCommon::{Data, FormType}, TextId};
 
 static mut CLASS: *mut Il2CppClass = null_mut();
@@ -84,9 +84,17 @@ pub fn init(umamusume: *const Il2CppImage) {
         CLASS = DialogManager;
         PUSHDIALOG_ADDR = get_method_addr(DialogManager, c"PushDialog", 1);
         PUSHSYSTEMDIALOG_ADDR =get_method_addr(DialogManager, c"PushSystemDialog", 2);
-        GETFOREFRONTDIALOG_METHOD = get_method(DialogManager, c"GetForeFrontDialog", 0).unwrap_or_else(|e| {
-            warn!("{}", e);
-            std::ptr::null()
-        });
+        // invoked with a null this, so only a static method will do (METHOD_ATTRIBUTE_STATIC)
+        GETFOREFRONTDIALOG_METHOD = match get_method(DialogManager, c"GetForeFrontDialog", 0) {
+            Ok(m) if il2cpp_method_get_flags(m, null_mut()) & 0x10 != 0 => m,
+            Ok(_) => {
+                warn!("DialogManager: GetForeFrontDialog is not static, treated as missing");
+                std::ptr::null()
+            }
+            Err(e) => {
+                warn!("{}", e);
+                std::ptr::null()
+            }
+        };
     }
 }
